@@ -27,6 +27,12 @@ cargo run -p claude-cli -- -p "Hello"
 export ANTHROPIC_BASE_URL="http://localhost:8080"
 ```
 
+## Override Model
+
+```bash
+export ANTHROPIC_MODEL="claude-sonnet-4-6"
+```
+
 ## OAuth Login (Manual PKCE)
 
 ```bash

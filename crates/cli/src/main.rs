@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
 use crate::args::{Args, Command, OutputFormat};
 
+const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -113,11 +115,7 @@ async fn run_headless(
     output: HeadlessOutput,
 ) -> anyhow::Result<()> {
     let client = claude_services::api::AnthropicClient::new(None);
-    let model = args
-        .model
-        .clone()
-        .or_else(|| settings.model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+    let model = resolve_model(args.model.clone(), settings.model.clone());
 
     let max_tokens = args.max_tokens.unwrap_or(1024);
     let max_turns = args.max_turns.unwrap_or(8);
@@ -284,5 +282,69 @@ fn print_cost_summary(result: &claude_query::RunResult) {
             "usage: in={} out={} model={} turns={}",
             result.usage.input_tokens, result.usage.output_tokens, result.model, result.turns
         );
+    }
+}
+
+fn resolve_model(cli_model: Option<String>, settings_model: Option<String>) -> String {
+    sanitize_opt(cli_model)
+        .or_else(anthropic_model_from_env)
+        .or_else(|| sanitize_opt(settings_model))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+fn anthropic_model_from_env() -> Option<String> {
+    std::env::var("ANTHROPIC_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn sanitize_opt(s: Option<String>) -> Option<String> {
+    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn default_model_is_used_when_env_and_settings_empty() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+        assert_eq!(resolve_model(None, None), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn env_model_is_used_when_provided() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_MODEL", " claude-3-5-haiku-20241022 ");
+        }
+        assert_eq!(
+            resolve_model(None, Some("claude-opus-4-6".to_string())),
+            "claude-3-5-haiku-20241022"
+        );
+        unsafe {
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
+    }
+
+    #[test]
+    fn cli_model_overrides_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022");
+        }
+        assert_eq!(
+            resolve_model(Some("claude-opus-4-6".to_string()), None),
+            "claude-opus-4-6"
+        );
+        unsafe {
+            std::env::remove_var("ANTHROPIC_MODEL");
+        }
     }
 }

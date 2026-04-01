@@ -186,7 +186,10 @@ mod tests {
         }
         let client = AnthropicClient::new(None);
         assert_eq!(client.base_url, DEFAULT_BASE_URL);
-        assert_eq!(client.messages_url(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            client.messages_url(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
