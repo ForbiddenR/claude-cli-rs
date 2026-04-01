@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{types::permissions::PermissionMode, CoreError, Result};
+use crate::{CoreError, Result, types::permissions::PermissionMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {

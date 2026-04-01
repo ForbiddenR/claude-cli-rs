@@ -4,4 +4,3 @@ pub mod auth;
 mod errors;
 
 pub use errors::{Result, ServicesError};
-

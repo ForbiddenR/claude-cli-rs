@@ -30,4 +30,3 @@ pub enum CoreError {
     #[error("failed to write config file: {path}")]
     WriteConfig { path: PathBuf },
 }
-

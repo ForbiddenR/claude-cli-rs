@@ -8,9 +8,9 @@ use oauth2::{CsrfToken, PkceCodeChallenge};
 use url::Url;
 
 use crate::{
-    auth::lockfile,
     Result,
     ServicesError::{self, InvalidOAuthRedirectUrl, OAuthTokenExchange},
+    auth::lockfile,
 };
 
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
@@ -144,7 +144,10 @@ pub async fn exchange_code_for_tokens(
     Ok(data)
 }
 
-pub async fn refresh_oauth_token(refresh_token: &str, scopes: Option<&[&str]>) -> Result<OAuthTokenResponse> {
+pub async fn refresh_oauth_token(
+    refresh_token: &str,
+    scopes: Option<&[&str]>,
+) -> Result<OAuthTokenResponse> {
     let http = reqwest::Client::new();
 
     let scope = (scopes.unwrap_or(DEFAULT_SCOPES)).join(" ");
@@ -214,10 +217,7 @@ pub async fn ensure_valid_oauth_token(
         }
     }
 
-    let refresh_token = fresh
-        .oauth_refresh_token
-        .clone()
-        .unwrap_or(refresh_token);
+    let refresh_token = fresh.oauth_refresh_token.clone().unwrap_or(refresh_token);
 
     let resp = refresh_oauth_token(&refresh_token, None).await?;
 

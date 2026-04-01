@@ -3,7 +3,9 @@ use tokio::process::Command;
 use crate::{Result, ServicesError};
 
 pub fn api_key_from_env() -> Option<String> {
-    std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 pub async fn api_key_from_helper(helper: &str) -> Result<String> {
@@ -32,4 +34,3 @@ pub async fn api_key_from_helper(helper: &str) -> Result<String> {
 
     Ok(key.to_string())
 }
-

@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{errors::CoreError, Result};
+use crate::{Result, errors::CoreError};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
@@ -77,7 +77,9 @@ pub fn default_global_config_path() -> Result<PathBuf> {
 pub fn load_global_config(path: &Path) -> Result<GlobalConfig> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(GlobalConfig::default()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GlobalConfig::default());
+        }
         Err(source) => return Err(CoreError::Io { source }),
     };
 
@@ -98,4 +100,3 @@ pub fn save_global_config(path: &Path, cfg: &GlobalConfig) -> Result<()> {
     fs::write(path, bytes)?;
     Ok(())
 }
-

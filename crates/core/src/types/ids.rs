@@ -50,4 +50,3 @@ impl FromStr for AgentId {
         Ok(Self(Uuid::parse_str(s)?))
     }
 }
-

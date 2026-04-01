@@ -1,4 +1,4 @@
-# claude-cli-rs (Weeks 1–2)
+# claude-cli-rs (Weeks 1–3)
 
 This folder contains the Rust rewrite workspace for the **headless/CLI-only** mode.
 
@@ -37,3 +37,4 @@ cargo run -p claude-cli -- -p "Hello"
 
 - Global config path (current stub): `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json`
 - Week 2 implements basic **API key auth + OAuth token flow + streaming API client**.
+- Week 3 adds a minimal **query engine** (system prompt + git/CLAUDE.md context injection, continuation on `max_tokens`, and cost tracking printed to stderr).

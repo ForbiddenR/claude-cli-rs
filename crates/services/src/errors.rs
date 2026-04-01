@@ -56,4 +56,7 @@ pub enum ServicesError {
 
     #[error("invalid oauth redirect URL: {detail}")]
     InvalidOAuthRedirectUrl { detail: String },
+
+    #[error("callback error: {detail}")]
+    Callback { detail: String },
 }

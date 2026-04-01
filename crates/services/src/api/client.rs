@@ -6,8 +6,8 @@ use reqwest_eventsource::{Event, EventSource};
 
 use claude_core::types::message::{ContentBlock, Message, UserMessage};
 
-use crate::auth::AuthMode;
 use crate::api::types::MessagesRequest;
+use crate::auth::AuthMode;
 use crate::{Result, ServicesError};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -46,6 +46,7 @@ impl AnthropicClient {
         let req = MessagesRequest {
             model: model.to_string(),
             max_tokens,
+            system: None,
             messages: vec![user],
             stream: true,
         };

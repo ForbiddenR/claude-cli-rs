@@ -98,6 +98,14 @@ pub struct Args {
     #[arg(long = "settings")]
     pub settings: Option<String>,
 
+    /// Override current working directory for the session.
+    #[arg(long = "cwd")]
+    pub cwd: Option<PathBuf>,
+
+    /// Enable git worktree mode (stub; retained for flag parity).
+    #[arg(long = "worktree", default_value_t = false)]
+    pub worktree: bool,
+
     /// Additional directories to allow tool access to.
     #[arg(long = "add-dir")]
     pub add_dir: Vec<PathBuf>,

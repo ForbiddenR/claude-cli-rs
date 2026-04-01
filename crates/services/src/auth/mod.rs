@@ -5,19 +5,15 @@ mod oauth;
 use std::path::Path;
 
 use claude_core::{
-    config::{global::GlobalConfig, settings::Settings},
     Result as CoreResult,
+    config::{global::GlobalConfig, settings::Settings},
 };
 
 use crate::{Result, ServicesError};
 
 pub use oauth::{
-    build_manual_oauth_authorize_url,
-    exchange_code_for_tokens,
-    parse_oauth_redirect_url,
-    OAuthStart,
-    OAuthTokenResponse,
-    ParsedOAuthRedirect,
+    OAuthStart, OAuthTokenResponse, ParsedOAuthRedirect, build_manual_oauth_authorize_url,
+    exchange_code_for_tokens, parse_oauth_redirect_url,
 };
 
 #[derive(Debug, Clone)]

@@ -212,6 +212,7 @@ dependencies = [
  "anyhow",
  "clap",
  "claude-core",
+ "claude-query",
  "claude-services",
  "serde_json",
  "tokio",
@@ -236,7 +237,9 @@ name = "claude-query"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "claude-core",
+ "claude-services",
  "serde",
  "serde_json",
  "tokio",

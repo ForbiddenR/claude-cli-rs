@@ -32,4 +32,3 @@ pub enum PermissionMode {
     #[value(name = "bubble")]
     Bubble,
 }
-
