@@ -1,0 +1,15 @@
+[package]
+name = "claude-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "claude-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+claude-core = { path = "../core" }
+tokio.workspace = true
