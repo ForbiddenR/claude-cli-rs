@@ -21,6 +21,12 @@ export ANTHROPIC_API_KEY="..."
 cargo run -p claude-cli -- -p "Hello"
 ```
 
+## Override API Base URL
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8080"
+```
+
 ## OAuth Login (Manual PKCE)
 
 ```bash
