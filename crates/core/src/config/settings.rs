@@ -13,22 +13,42 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "permissionMode",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub permission_mode: Option<PermissionMode>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "apiKeyHelper",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub api_key_helper: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "allowedTools",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub allowed_tools: Option<Vec<String>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "disallowedTools",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub disallowed_tools: Option<Vec<String>>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "customSystemPrompt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub custom_system_prompt: Option<String>,
 }
 
@@ -131,5 +151,12 @@ mod tests {
         assert_eq!(env.get("B").map(String::as_str), Some("2"));
         assert_eq!(env.get("C").map(String::as_str), Some("2"));
     }
-}
 
+    #[test]
+    fn load_settings_arg_supports_camel_case_aliases() {
+        let s = load_settings_arg(r#"{ "apiKeyHelper": "echo hi", "allowedTools": ["bash"] }"#)
+            .expect("should parse");
+        assert_eq!(s.api_key_helper.as_deref(), Some("echo hi"));
+        assert_eq!(s.allowed_tools.unwrap(), vec!["bash".to_string()]);
+    }
+}

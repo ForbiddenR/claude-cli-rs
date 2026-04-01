@@ -12,4 +12,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 claude-core = { path = "../core" }
+claude-services = { path = "../services" }
+serde_json.workspace = true
 tokio.workspace = true

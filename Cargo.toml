@@ -23,10 +23,14 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP (Week 2+; declared early to avoid churn)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest-eventsource = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Auth
+oauth2 = { version = "4", default-features = false }
 
 # Errors
 thiserror = "2"
@@ -36,3 +40,5 @@ anyhow = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+url = "2"

@@ -27,7 +27,7 @@ pub enum ThinkingMode {
 #[derive(Debug, Parser)]
 #[command(name = "claude-rs", about = "Claude Code (headless) rewritten in Rust")]
 pub struct Args {
-    /// Prompt to send. If omitted, stdin may be used (future).
+    /// Prompt to send. If omitted, stdin is read.
     pub prompt: Option<String>,
 
     /// Print response and exit (required; interactive mode is not implemented).
@@ -65,6 +65,10 @@ pub struct Args {
     /// Model override.
     #[arg(long = "model")]
     pub model: Option<String>,
+
+    /// API key override (otherwise uses ANTHROPIC_API_KEY, settings api_key_helper, or global config).
+    #[arg(long = "api-key")]
+    pub api_key: Option<String>,
 
     /// Permission mode override.
     #[arg(long = "permission-mode", value_enum)]
@@ -109,6 +113,10 @@ pub struct Args {
     /// Maximum number of agentic turns in print mode.
     #[arg(long = "max-turns")]
     pub max_turns: Option<u32>,
+
+    /// Maximum tokens to sample per API call in print mode.
+    #[arg(long = "max-tokens")]
+    pub max_tokens: Option<u32>,
 
     /// Maximum dollar amount to spend on API calls in print mode.
     #[arg(long = "max-budget-usd")]
@@ -164,11 +172,10 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Authentication helpers (stub).
+    /// OAuth login (manual PKCE flow).
     Auth,
     /// Diagnostics (stub).
     Doctor,
     /// MCP config helpers (stub).
     Mcp,
 }
-
