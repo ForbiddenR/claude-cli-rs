@@ -11,3 +11,8 @@ claude-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+dirs.workspace = true
+globwalk.workspace = true
+walkdir.workspace = true
+grep.workspace = true
+similar.workspace = true

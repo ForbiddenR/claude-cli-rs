@@ -63,6 +63,7 @@ impl AnthropicClient {
             model: model.to_string(),
             max_tokens,
             system: None,
+            tools: None,
             messages: vec![user],
             stream: true,
         };

@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Tool framework and built-in tools for the headless Claude Code Rust rewrite.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod builtin;
+pub mod registry;
+pub mod trait_def;
+pub mod util;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use registry::{ToolMetadata, ToolRegistry};
+pub use trait_def::{PermissionResult, Tool, ToolRef, ToolResult, ToolUseContext};

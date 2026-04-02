@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 claude-core = { path = "../core" }
 claude-services = { path = "../services" }
+claude-tools = { path = "../tools" }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

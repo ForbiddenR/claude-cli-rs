@@ -5,6 +5,7 @@ use clap::Parser;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
 use crate::args::{Args, Command, OutputFormat};
+use claude_core::types::permissions::PermissionMode;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
@@ -125,6 +126,17 @@ async fn run_headless(
 
     let cwd = std::env::current_dir()?;
 
+    let permission_mode = args
+        .permission_mode
+        .or(settings.permission_mode)
+        .unwrap_or(PermissionMode::Default);
+
+    let mut allowed_tools = settings.allowed_tools.clone().unwrap_or_default();
+    allowed_tools.extend(args.allowed_tools.clone());
+
+    let mut disallowed_tools = settings.disallowed_tools.clone().unwrap_or_default();
+    disallowed_tools.extend(args.disallowed_tools.clone());
+
     let engine = claude_query::QueryEngine::new(
         client,
         auth,
@@ -139,8 +151,12 @@ async fn run_headless(
             json_schema: args.json_schema.clone(),
             max_turns,
             max_budget_usd: args.max_budget_usd,
+            permission_mode,
+            base_tools: args.tools.clone(),
+            allowed_tools,
+            disallowed_tools,
         },
-    );
+    )?;
 
     match output {
         HeadlessOutput::Text => {

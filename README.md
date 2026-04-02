@@ -1,4 +1,4 @@
-# claude-cli-rs (Weeks 1–3)
+# claude-cli-rs (Weeks 1–4)
 
 This folder contains the Rust rewrite workspace for the **headless/CLI-only** mode.
 
@@ -33,6 +33,18 @@ export ANTHROPIC_AUTH_TOKEN="..."
 cargo run -p claude-cli -- -p "Hello"
 ```
 
+## Tool Execution (Week 4)
+
+By default, "dangerous" tools like `Bash`, `Write`, and `Edit` are disabled. Enable them with a permission mode:
+
+```bash
+cd claude-cli-rs
+. "$HOME/.cargo/env"
+
+export ANTHROPIC_API_KEY="..."
+cargo run -p claude-cli -- -p "Create hello.py and run it" --permission-mode acceptEdits
+```
+
 ## Override API Base URL
 
 ```bash
@@ -62,3 +74,4 @@ cargo run -p claude-cli -- -p "Hello"
 - Global config path (current stub): `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json`
 - Week 2 implements basic **API key auth + OAuth token flow + streaming API client**.
 - Week 3 adds a minimal **query engine** (system prompt + git/CLAUDE.md context injection, continuation on `max_tokens`, and cost tracking printed to stderr).
+- Week 4 adds a minimal **tool framework** + built-in `Bash/Read/Write/Edit/Glob/Grep`.

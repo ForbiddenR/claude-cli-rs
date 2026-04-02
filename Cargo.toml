@@ -42,3 +42,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 url = "2"
+
+# File system (Week 4)
+globwalk = "0.9"
+walkdir = "2"
+grep = "0.4"
+similar = "3"
