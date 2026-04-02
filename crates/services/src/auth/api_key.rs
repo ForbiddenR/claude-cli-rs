@@ -5,7 +5,8 @@ use crate::{Result, ServicesError};
 pub fn api_key_from_env() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub async fn api_key_from_helper(helper: &str) -> Result<String> {

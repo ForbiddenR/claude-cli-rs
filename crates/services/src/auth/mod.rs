@@ -1,4 +1,5 @@
 mod api_key;
+mod auth_token;
 mod lockfile;
 mod oauth;
 
@@ -19,6 +20,7 @@ pub use oauth::{
 #[derive(Debug, Clone)]
 pub enum AuthMode {
     ApiKey(String),
+    AuthToken(String),
     OAuthToken(String),
 }
 
@@ -33,6 +35,16 @@ impl AuthMode {
                             detail: "api key contains invalid characters for an HTTP header",
                         }
                     })?,
+                );
+            }
+            AuthMode::AuthToken(token) => {
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(
+                        |_source| ServicesError::MissingAuth {
+                            detail: "auth token contains invalid characters for an HTTP header",
+                        },
+                    )?,
                 );
             }
             AuthMode::OAuthToken(token) => {
@@ -76,6 +88,10 @@ pub async fn resolve_auth(
         return Ok(AuthMode::ApiKey(key));
     }
 
+    if let Some(token) = auth_token::auth_token_from_env() {
+        return Ok(AuthMode::AuthToken(token));
+    }
+
     if let Ok(token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
@@ -103,7 +119,7 @@ pub async fn resolve_auth(
     }
 
     Err(ServicesError::MissingAuth {
-        detail: "no oauth token or api key available",
+        detail: "no auth token, oauth token, or api key available",
     })
 }
 
@@ -150,4 +166,92 @@ pub fn clear_api_key(cfg: &mut GlobalConfig) {
 
 pub fn save_global_config(path: &Path, cfg: &GlobalConfig) -> CoreResult<()> {
     claude_core::config::global::save_global_config(path, cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn prefers_anthropic_auth_token_over_other_sources() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "  tok_123  ");
+            std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "oauth_456");
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-abc");
+        }
+
+        let mut global_cfg = GlobalConfig::default();
+        let settings = Settings::default();
+
+        let auth = resolve_auth(
+            Path::new("/tmp/.claude.json"),
+            &mut global_cfg,
+            &settings,
+            ResolveAuthOpts {
+                cli_api_key: None,
+                bare: false,
+            },
+        )
+        .await
+        .expect("should resolve");
+
+        match auth {
+            AuthMode::AuthToken(tok) => assert_eq!(tok, "tok_123"),
+            other => panic!("expected AuthToken, got {other:?}"),
+        }
+
+        unsafe {
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_mode_ignores_auth_token_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok_123");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        let mut global_cfg = GlobalConfig::default();
+        let settings = Settings::default();
+
+        let err = resolve_auth(
+            Path::new("/tmp/.claude.json"),
+            &mut global_cfg,
+            &settings,
+            ResolveAuthOpts {
+                cli_api_key: None,
+                bare: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("ANTHROPIC_API_KEY"), "unexpected error: {msg}");
+
+        unsafe {
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        }
+    }
+
+    #[test]
+    fn api_key_env_is_trimmed() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "  sk-ant-abc  ");
+        }
+
+        assert_eq!(api_key::api_key_from_env().as_deref(), Some("sk-ant-abc"));
+
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+    }
 }

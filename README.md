@@ -21,6 +21,18 @@ export ANTHROPIC_API_KEY="..."
 cargo run -p claude-cli -- -p "Hello"
 ```
 
+## Run A Prompt (Auth Token)
+
+Uses `Authorization: Bearer ...`.
+
+```bash
+cd claude-cli-rs
+. "$HOME/.cargo/env"
+
+export ANTHROPIC_AUTH_TOKEN="..."
+cargo run -p claude-cli -- -p "Hello"
+```
+
 ## Override API Base URL
 
 ```bash
