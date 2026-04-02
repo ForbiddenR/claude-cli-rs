@@ -5,7 +5,7 @@ use grep::matcher::Matcher as _;
 use grep::regex::RegexMatcherBuilder;
 use grep::searcher::{BinaryDetection, SearcherBuilder, sinks::Bytes};
 
-use crate::util::{absolutize, expand_tilde, is_path_allowed, normalize_path, truncate_chars};
+use crate::util::{absolutize, expand_tilde, is_path_allowed, normalize_path};
 use crate::{PermissionResult, Tool, ToolResult, ToolUseContext};
 
 const TOOL_NAME: &str = "Grep";
@@ -156,13 +156,6 @@ impl Tool for GrepTool {
             )
         })
         .await??;
-
-        let (out, truncated_by_chars) = truncate_chars(&out, self.max_result_size_chars());
-        let out = if truncated_by_chars {
-            format!("{out}\n(output truncated)")
-        } else {
-            out
-        };
 
         Ok(ToolResult::ok_text(out))
     }
@@ -341,11 +334,13 @@ fn grep_search(
                     &path,
                     Bytes(|_lnum, bytes| {
                         let bytes = strip_line_term(bytes);
-                        matcher.find_iter(bytes, |m| {
-                            let _ = m;
-                            count += 1;
-                            true
-                        }).unwrap();
+                        matcher
+                            .find_iter(bytes, |m| {
+                                let _ = m;
+                                count += 1;
+                                true
+                            })
+                            .unwrap();
                         Ok(true)
                     }),
                 );

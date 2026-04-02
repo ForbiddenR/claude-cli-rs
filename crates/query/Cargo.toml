@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 claude-core = { path = "../core" }
 claude-services = { path = "../services" }
 claude-tools = { path = "../tools" }

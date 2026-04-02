@@ -4,7 +4,19 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use claude_core::types::permissions::PermissionMode;
 
-#[derive(Debug, Clone)]
+use crate::{SessionState, ToolResultStore};
+
+#[async_trait]
+pub trait AgentExecutor: Send + Sync {
+    async fn run_agent(
+        &self,
+        description: Option<String>,
+        prompt: String,
+        depth: u32,
+    ) -> anyhow::Result<String>;
+}
+
+#[derive(Clone)]
 pub struct ToolUseContext {
     /// The session working directory.
     pub cwd: PathBuf,
@@ -16,6 +28,22 @@ pub struct ToolUseContext {
     pub allowed_roots: Vec<PathBuf>,
 
     pub permission_mode: PermissionMode,
+
+    /// Mutable per-session state (todos, tasks, etc).
+    pub session: Arc<SessionState>,
+
+    /// Where to persist large tool outputs so they remain accessible without
+    /// blowing out the model context window.
+    pub result_store: Arc<ToolResultStore>,
+
+    /// Allows tools (Agent) to spawn sub-agents.
+    pub agent: Option<Arc<dyn AgentExecutor>>,
+
+    /// Sub-agent recursion depth; 0 for the main session.
+    pub agent_depth: u32,
+
+    /// Safety cap on recursive agent spawning.
+    pub max_agent_depth: u32,
 }
 
 impl ToolUseContext {

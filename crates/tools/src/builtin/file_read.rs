@@ -125,8 +125,8 @@ fn resolve_path(ctx: &ToolUseContext, raw: &str) -> PathBuf {
 }
 
 fn read_file_range(path: PathBuf, offset: usize, limit: usize) -> anyhow::Result<String> {
-    let mut f = File::open(&path)
-        .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+    let mut f =
+        File::open(&path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
     let meta = f
         .metadata()
         .map_err(|e| anyhow::anyhow!("cannot stat {}: {e}", path.display()))?;
@@ -162,9 +162,8 @@ fn read_file_range(path: PathBuf, offset: usize, limit: usize) -> anyhow::Result
             }
         }
         TextEncoding::Utf8 { skip_bom } => {
-            f.seek(SeekFrom::Start(0)).map_err(|e| {
-                anyhow::anyhow!("cannot seek to start of {}: {e}", path.display())
-            })?;
+            f.seek(SeekFrom::Start(0))
+                .map_err(|e| anyhow::anyhow!("cannot seek to start of {}: {e}", path.display()))?;
             let mut reader = BufReader::new(f);
 
             let mut line_no: usize = 0;

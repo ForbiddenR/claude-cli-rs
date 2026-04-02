@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::util::truncate_chars;
 use crate::{PermissionResult, Tool, ToolResult, ToolUseContext};
 
 const TOOL_NAME: &str = "Bash";
@@ -126,17 +125,17 @@ impl Tool for BashTool {
             out
         });
 
-        let status = match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await
-        {
-            Ok(res) => res?,
-            Err(_elapsed) => {
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
-                return Ok(ToolResult::err_text(format!(
-                    "command timed out after {timeout_ms}ms"
-                )));
-            }
-        };
+        let status =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(res) => res?,
+                Err(_elapsed) => {
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+                    return Ok(ToolResult::err_text(format!(
+                        "command timed out after {timeout_ms}ms"
+                    )));
+                }
+            };
 
         let stdout = stdout_task.await.unwrap_or_default();
         let stderr = stderr_task.await.unwrap_or_default();
@@ -153,13 +152,6 @@ impl Tool for BashTool {
         content.push_str(stderr.trim_end());
         content.push('\n');
         content.push_str(&format!("\n[exit_code]\n{code}\n"));
-
-        let (content, truncated) = truncate_chars(&content, self.max_result_size_chars());
-        let content = if truncated {
-            format!("{content}\n(output truncated)")
-        } else {
-            content
-        };
 
         Ok(ToolResult {
             content: serde_json::Value::String(content),
@@ -185,11 +177,7 @@ fn build_shell_command(command: &str) -> Command {
     }
 }
 
-async fn read_stream_limited<R: AsyncReadExt + Unpin>(
-    r: &mut R,
-    limit: usize,
-    out: &mut Vec<u8>,
-) {
+async fn read_stream_limited<R: AsyncReadExt + Unpin>(r: &mut R, limit: usize, out: &mut Vec<u8>) {
     let mut buf = [0u8; 8192];
     loop {
         match r.read(&mut buf).await {

@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
 use crate::args::{Args, Command, OutputFormat};
 use claude_core::types::permissions::PermissionMode;
+use std::collections::HashMap;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
@@ -137,6 +138,8 @@ async fn run_headless(
     let mut disallowed_tools = settings.disallowed_tools.clone().unwrap_or_default();
     disallowed_tools.extend(args.disallowed_tools.clone());
 
+    let mcp_servers = resolve_mcp_servers(args, settings)?;
+
     let engine = claude_query::QueryEngine::new(
         client,
         auth,
@@ -155,6 +158,9 @@ async fn run_headless(
             base_tools: args.tools.clone(),
             allowed_tools,
             disallowed_tools,
+            mcp_servers,
+            agent_depth: 0,
+            max_agent_depth: 2,
         },
     )?;
 
@@ -317,6 +323,42 @@ fn anthropic_model_from_env() -> Option<String> {
 
 fn sanitize_opt(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn resolve_mcp_servers(
+    args: &Args,
+    settings: &claude_core::config::settings::Settings,
+) -> anyhow::Result<HashMap<String, claude_core::config::mcp::McpServerConfig>> {
+    let mut out: HashMap<String, claude_core::config::mcp::McpServerConfig> = HashMap::new();
+
+    if !args.strict_mcp_config {
+        if let Some(servers) = &settings.mcp_servers {
+            out.extend(servers.clone());
+        }
+    }
+
+    for raw in &args.mcp_config {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let cfg = load_mcp_config_arg(raw)?;
+        out.extend(cfg.mcp_servers);
+    }
+
+    Ok(out)
+}
+
+fn load_mcp_config_arg(raw: &str) -> anyhow::Result<claude_core::config::mcp::McpJsonConfig> {
+    let as_path = std::path::PathBuf::from(raw);
+    if as_path.exists() {
+        let bytes = std::fs::read(&as_path)
+            .with_context(|| format!("reading MCP config {}", as_path.display()))?;
+        return Ok(serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing MCP config {}", as_path.display()))?);
+    }
+
+    Ok(serde_json::from_str(raw).with_context(|| "parsing MCP config JSON")?)
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result, types::permissions::PermissionMode};
+use crate::{CoreError, Result, config::mcp::McpServerConfig, types::permissions::PermissionMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
@@ -29,6 +29,9 @@ pub struct Settings {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
+
+    #[serde(default, alias = "mcpServers", skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
     #[serde(
         default,
@@ -60,6 +63,8 @@ impl Settings {
         let mut out = Settings::default();
         let mut merged_env: HashMap<String, String> = HashMap::new();
         let mut saw_env = false;
+        let mut merged_mcp: HashMap<String, McpServerConfig> = HashMap::new();
+        let mut saw_mcp = false;
 
         for layer in layers {
             if layer.model.is_some() {
@@ -87,10 +92,21 @@ impl Settings {
                     merged_env.insert(k.clone(), v.clone());
                 }
             }
+
+            if let Some(servers) = &layer.mcp_servers {
+                saw_mcp = true;
+                for (k, v) in servers {
+                    merged_mcp.insert(k.clone(), v.clone());
+                }
+            }
         }
 
         if saw_env {
             out.env = Some(merged_env);
+        }
+
+        if saw_mcp {
+            out.mcp_servers = Some(merged_mcp);
         }
 
         out

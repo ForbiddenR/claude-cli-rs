@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::builtin;
 use crate::ToolRef;
+use crate::builtin;
 
 #[derive(Debug, Clone)]
 pub struct ToolMetadata {
@@ -92,12 +92,24 @@ fn name_set(names: &[String]) -> HashSet<String> {
 }
 
 pub fn assemble_tool_pool(opts: ToolPoolOpts) -> anyhow::Result<ToolRegistry> {
-    let mut tools = builtin::default_builtin_tools();
+    assemble_tool_pool_with_extra(Vec::new(), opts)
+}
+
+pub fn assemble_tool_pool_with_extra(
+    extra: Vec<ToolRef>,
+    opts: ToolPoolOpts,
+) -> anyhow::Result<ToolRegistry> {
+    // `--tools` is intended to control the built-in tool set, not dynamically
+    // discovered tools (e.g., MCP). So we apply `base_tools` only to builtins.
+    let mut builtins = builtin::default_builtin_tools();
 
     let base = name_set(&parse_tool_list(&opts.base_tools));
     if !base.is_empty() {
-        tools.retain(|t| base.contains(&t.name().to_ascii_lowercase()));
+        builtins.retain(|t| base.contains(&t.name().to_ascii_lowercase()));
     }
+
+    let mut tools = builtins;
+    tools.extend(extra);
 
     let allowed = name_set(&parse_tool_list(&opts.allowed_tools));
     if !allowed.is_empty() {

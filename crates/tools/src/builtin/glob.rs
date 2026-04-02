@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::util::{absolutize, expand_tilde, is_path_allowed, normalize_path, truncate_chars};
+use crate::util::{absolutize, expand_tilde, is_path_allowed, normalize_path};
 use crate::{PermissionResult, Tool, ToolResult, ToolUseContext};
 
 const TOOL_NAME: &str = "Glob";
@@ -84,13 +84,6 @@ impl Tool for GlobTool {
 
         let out = tokio::task::spawn_blocking(move || glob_search(&cwd, &root, &pattern, limit))
             .await??;
-
-        let (out, truncated_by_chars) = truncate_chars(&out, self.max_result_size_chars());
-        let out = if truncated_by_chars {
-            format!("{out}\n(output truncated)")
-        } else {
-            out
-        };
 
         Ok(ToolResult::ok_text(out))
     }

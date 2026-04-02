@@ -1,5 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use claude_core::config::mcp::McpServerConfig;
 use claude_core::types::message::{
     AssistantMessage, ContentBlock, Message, StopReason, TokenUsage, UserMessage,
 };
@@ -9,11 +14,14 @@ use claude_services::ServicesError;
 use claude_services::api::{AnthropicClient, MessagesRequest, ToolDefinition};
 use claude_services::auth::AuthMode;
 
-use claude_tools::registry::{ToolPoolOpts, assemble_tool_pool};
-use claude_tools::{PermissionResult, ToolRegistry, ToolUseContext};
+use claude_tools::registry::{ToolPoolOpts, assemble_tool_pool_with_extra};
+use claude_tools::{
+    AgentExecutor, PermissionResult, SessionState, ToolRegistry, ToolResultStore, ToolUseContext,
+};
 
 use crate::context::{ContextOpts, gather_context};
 use crate::cost::calculate_usd_cost;
+use crate::mcp_tools::connect_mcp_tools;
 use crate::stream_parser::StreamParser;
 use crate::system_prompt::{SystemPromptParts, build_system_prompt};
 
@@ -38,6 +46,13 @@ pub struct QueryEngineConfig {
     pub base_tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+
+    // Week 5: MCP servers
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    // Internal: agent recursion tracking (used by the Agent tool).
+    pub agent_depth: u32,
+    pub max_agent_depth: u32,
 }
 
 pub struct QueryEngine {
@@ -46,7 +61,7 @@ pub struct QueryEngine {
     model: String,
     max_tokens: u32,
     cfg: QueryEngineConfig,
-    tools: ToolRegistry,
+    tool_opts: ToolPoolOpts,
 }
 
 #[derive(Debug, Clone)]
@@ -66,11 +81,11 @@ impl QueryEngine {
         max_tokens: u32,
         cfg: QueryEngineConfig,
     ) -> anyhow::Result<Self> {
-        let tools = assemble_tool_pool(ToolPoolOpts {
+        let tool_opts = ToolPoolOpts {
             base_tools: cfg.base_tools.clone(),
             allowed_tools: cfg.allowed_tools.clone(),
             disallowed_tools: cfg.disallowed_tools.clone(),
-        })?;
+        };
 
         Ok(Self {
             client,
@@ -78,7 +93,7 @@ impl QueryEngine {
             model,
             max_tokens,
             cfg,
-            tools,
+            tool_opts,
         })
     }
 
@@ -95,7 +110,7 @@ impl QueryEngine {
             },
         )?;
 
-        let system = build_system_prompt(
+        let mut system = build_system_prompt(
             &ctx,
             SystemPromptParts {
                 base: self.cfg.system_prompt.as_deref(),
@@ -105,8 +120,18 @@ impl QueryEngine {
             },
         );
 
-        let tool_defs = self
-            .tools
+        let mcp = connect_mcp_tools(&self.cfg.mcp_servers).await;
+        if !mcp.instructions.is_empty() {
+            system.push_str("\n\n# MCP Server Instructions\n");
+            for (name, instr) in &mcp.instructions {
+                system.push_str(&format!("\n## {name}\n\n{}\n", instr.trim()));
+            }
+            system = system.trim_end().to_string();
+        }
+
+        let tools = assemble_tool_pool_with_extra(mcp.tools, self.tool_opts.clone())?;
+
+        let tool_defs = tools
             .metadata()
             .into_iter()
             .map(|m| ToolDefinition {
@@ -129,10 +154,31 @@ impl QueryEngine {
         let mut combined_cost: Option<f64> = Some(0.0);
         let mut resolved_model: Option<String> = None;
 
+        let session = Arc::new(SessionState::default());
+        let (result_store, result_dir) = create_result_store(&self.cfg.cwd);
+
+        let mut allowed_roots = build_allowed_roots(&self.cfg.cwd, &self.cfg.add_dirs);
+        if !allowed_roots.iter().any(|p| p == &result_dir) {
+            allowed_roots.push(result_dir);
+        }
+
+        let agent_exec: Arc<dyn AgentExecutor> = Arc::new(QueryAgentExecutor::new(
+            self.client.clone(),
+            self.auth.clone(),
+            self.model.clone(),
+            self.max_tokens,
+            self.cfg.clone(),
+        ));
+
         let mut tool_ctx = ToolUseContext {
             cwd: self.cfg.cwd.clone(),
-            allowed_roots: build_allowed_roots(&self.cfg.cwd, &self.cfg.add_dirs),
+            allowed_roots,
             permission_mode: self.cfg.permission_mode,
+            session,
+            result_store,
+            agent: Some(agent_exec),
+            agent_depth: self.cfg.agent_depth,
+            max_agent_depth: self.cfg.max_agent_depth,
         };
 
         loop {
@@ -233,9 +279,9 @@ impl QueryEngine {
 
                 let can_parallelize = tool_calls.len() > 1
                     && tool_calls.iter().all(|call| {
-                        self.tools
-                            .get(&call.name)
-                            .is_some_and(|t| t.is_concurrency_safe(&call.input) && t.is_read_only(&call.input))
+                        tools.get(&call.name).is_some_and(|t| {
+                            t.is_concurrency_safe(&call.input) && t.is_read_only(&call.input)
+                        })
                     });
 
                 let tool_results: Vec<ContentBlock> = if can_parallelize {
@@ -243,7 +289,7 @@ impl QueryEngine {
                     let mut handles = Vec::with_capacity(tool_calls.len());
 
                     for call in tool_calls {
-                        let tools = self.tools.clone();
+                        let tools = tools.clone();
                         let mut ctx = tool_ctx.clone();
                         handles.push(tokio::spawn(async move {
                             execute_tool_call(&tools, &mut ctx, call).await
@@ -255,7 +301,10 @@ impl QueryEngine {
                         match h.await {
                             Ok(block) => out.push(block),
                             Err(err) => out.push(ContentBlock::ToolResult {
-                                tool_use_id: ids.get(idx).cloned().unwrap_or_else(|| "unknown".to_string()),
+                                tool_use_id: ids
+                                    .get(idx)
+                                    .cloned()
+                                    .unwrap_or_else(|| "unknown".to_string()),
                                 content: serde_json::Value::String(format!(
                                     "tool task failed: {err}"
                                 )),
@@ -267,7 +316,7 @@ impl QueryEngine {
                 } else {
                     let mut tool_results: Vec<ContentBlock> = Vec::new();
                     for call in tool_calls {
-                        let block = execute_tool_call(&self.tools, &mut tool_ctx, call).await;
+                        let block = execute_tool_call(&tools, &mut tool_ctx, call).await;
                         tool_results.push(block);
                     }
                     tool_results
@@ -351,15 +400,7 @@ async fn execute_tool_call(
 
     match tool.call(input, ctx).await {
         Ok(mut result) => {
-            // Enforce a max size in case a tool returns a huge inline string.
-            if let serde_json::Value::String(s) = &result.content {
-                if s.chars().count() > tool.max_result_size_chars() {
-                    let mut truncated = String::new();
-                    truncated.extend(s.chars().take(tool.max_result_size_chars()));
-                    truncated.push_str("\n(output truncated)");
-                    result.content = serde_json::Value::String(truncated);
-                }
-            }
+            persist_large_tool_result(tool.as_ref(), &mut result, ctx);
 
             ContentBlock::ToolResult {
                 tool_use_id: id,
@@ -373,6 +414,79 @@ async fn execute_tool_call(
             is_error: true,
         },
     }
+}
+
+fn persist_large_tool_result(
+    tool: &dyn claude_tools::Tool,
+    result: &mut claude_tools::ToolResult,
+    ctx: &ToolUseContext,
+) {
+    let max = tool.max_result_size_chars();
+
+    match &result.content {
+        serde_json::Value::String(s) => {
+            let len = s.chars().count();
+            if len <= max {
+                return;
+            }
+
+            let path = ctx.result_store.store_text(tool.name(), s);
+            match path {
+                Ok(path) => {
+                    let preview = truncate_chars(s, max);
+                    let msg = format!(
+                        "Tool output was {len} chars and was saved to {}\nUse the Read tool on that path to view the full output.\n\nPreview (truncated to {max} chars):\n{preview}\n\n(full output in file)",
+                        path.display()
+                    );
+                    result.content = serde_json::Value::String(msg);
+                }
+                Err(_err) => {
+                    let preview = truncate_chars(s, max);
+                    result.content = serde_json::Value::String(format!(
+                        "{preview}\n\n(output truncated; failed to persist full output)"
+                    ));
+                }
+            }
+        }
+        other => {
+            // For non-string results, only persist if the JSON rendering is large.
+            let rendered = match serde_json::to_string_pretty(other) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let len = rendered.chars().count();
+            if len <= max {
+                return;
+            }
+
+            let path = ctx.result_store.store_json(tool.name(), other);
+            match path {
+                Ok(path) => {
+                    let preview = truncate_chars(&rendered, max);
+                    let msg = format!(
+                        "Tool output was {len} chars and was saved to {}\nUse the Read tool on that path to view the full output.\n\nPreview (truncated to {max} chars):\n{preview}\n\n(full output in file)",
+                        path.display()
+                    );
+                    result.content = serde_json::Value::String(msg);
+                }
+                Err(_err) => {
+                    let preview = truncate_chars(&rendered, max);
+                    result.content = serde_json::Value::String(format!(
+                        "{preview}\n\n(output truncated; failed to persist full output)"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    out.extend(s.chars().take(max_chars));
+    out
 }
 
 fn build_allowed_roots(cwd: &PathBuf, add_dirs: &[PathBuf]) -> Vec<PathBuf> {
@@ -389,4 +503,83 @@ fn build_allowed_roots(cwd: &PathBuf, add_dirs: &[PathBuf]) -> Vec<PathBuf> {
     }
 
     out
+}
+
+fn create_result_store(cwd: &PathBuf) -> (Arc<ToolResultStore>, PathBuf) {
+    let preferred = cwd.join(".claude-rs").join("tool-results");
+    match ToolResultStore::new(preferred.clone()) {
+        Ok(store) => (Arc::new(store), preferred),
+        Err(_) => {
+            let fallback = std::env::temp_dir().join("claude-rs").join("tool-results");
+            match ToolResultStore::new(fallback.clone()) {
+                Ok(store) => (Arc::new(store), fallback),
+                Err(_) => {
+                    // Last resort: store into cwd directly.
+                    let store = ToolResultStore::new(cwd.clone())
+                        .expect("cwd should be a valid directory for result storage");
+                    (Arc::new(store), cwd.clone())
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct QueryAgentExecutor {
+    client: AnthropicClient,
+    auth: AuthMode,
+    model: String,
+    max_tokens: u32,
+    cfg: QueryEngineConfig,
+}
+
+impl QueryAgentExecutor {
+    fn new(
+        client: AnthropicClient,
+        auth: AuthMode,
+        model: String,
+        max_tokens: u32,
+        cfg: QueryEngineConfig,
+    ) -> Self {
+        Self {
+            client,
+            auth,
+            model,
+            max_tokens,
+            cfg,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentExecutor for QueryAgentExecutor {
+    async fn run_agent(
+        &self,
+        description: Option<String>,
+        prompt: String,
+        depth: u32,
+    ) -> anyhow::Result<String> {
+        let mut cfg = self.cfg.clone();
+
+        // Limit sub-agent autonomy; it should return a report, not spin indefinitely.
+        cfg.max_turns = cfg.max_turns.min(4).max(1);
+        cfg.agent_depth = depth;
+
+        // Annotate the sub-agent prompt to preserve user intent.
+        let prompt = match description {
+            Some(d) if !d.trim().is_empty() => format!("[Task] {d}\n\n{prompt}"),
+            _ => prompt,
+        };
+
+        let engine = QueryEngine::new(
+            self.client.clone(),
+            self.auth.clone(),
+            self.model.clone(),
+            self.max_tokens,
+            cfg,
+        )?;
+
+        let result = engine.run(&prompt, |_event| Ok(())).await?;
+        Ok(result.text)
+    }
 }

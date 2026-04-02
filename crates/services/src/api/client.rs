@@ -13,6 +13,7 @@ use crate::{Result, ServicesError};
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+#[derive(Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
     base_url: String,
