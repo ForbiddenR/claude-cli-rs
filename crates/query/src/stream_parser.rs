@@ -242,3 +242,136 @@ fn parse_stop_reason(raw: &str) -> StopReason {
         _ => StopReason::Unknown,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_deltas_concatenate() {
+        let mut p = StreamParser::default();
+
+        p.process_event(&serde_json::json!({
+            "type": "message_start",
+            "message": { "model": "m", "usage": { "input_tokens": 1, "output_tokens": 0 } }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "hello" }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": " world" }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        }))
+        .unwrap();
+
+        let parsed = p.finish();
+        assert_eq!(parsed.text, "hello world");
+        assert_eq!(parsed.message.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn parses_tool_use_with_input_json_deltas() {
+        let mut p = StreamParser::default();
+
+        p.process_event(&serde_json::json!({
+            "type": "message_start",
+            "message": { "model": "m", "usage": { "input_tokens": 1, "output_tokens": 0 } }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "tool_use", "id": "toolu_1", "name": "Write" }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"file_path\":\"a\"," }
+        }))
+        .unwrap();
+        p.process_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "input_json_delta", "partial_json": "\"content\":\"b\"}" }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" },
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }))
+        .unwrap();
+
+        let parsed = p.finish();
+        assert_eq!(parsed.message.stop_reason, Some(StopReason::ToolUse));
+        assert!(parsed.text.is_empty());
+
+        match &parsed.message.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "Write");
+                assert_eq!(input.get("file_path").and_then(|v| v.as_str()), Some("a"));
+                assert_eq!(input.get("content").and_then(|v| v.as_str()), Some("b"));
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_input_json_falls_back_to_input_value() {
+        let mut p = StreamParser::default();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "X",
+                "input": { "x": 1 }
+            }
+        }))
+        .unwrap();
+
+        p.process_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "input_json_delta", "partial_json": "{" }
+        }))
+        .unwrap();
+
+        let parsed = p.finish();
+
+        match &parsed.message.content[0] {
+            ContentBlock::ToolUse { input, .. } => {
+                assert_eq!(input.get("x").and_then(|v| v.as_i64()), Some(1));
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+    }
+}

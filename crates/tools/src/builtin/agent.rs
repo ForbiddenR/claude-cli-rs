@@ -115,3 +115,128 @@ impl Tool for AgentTool {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::BypassPermissions,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_tool_errors_when_no_executor_configured() {
+        let cwd = temp_dir("agent-none");
+        let mut ctx = ctx_for(cwd);
+        let tool = AgentTool::default();
+
+        let input = serde_json::json!({
+            "description": "Test",
+            "prompt": "Do something",
+        });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_enforces_recursion_depth_cap() {
+        let cwd = temp_dir("agent-depth");
+        let mut ctx = ctx_for(cwd);
+        ctx.agent_depth = 2;
+        ctx.max_agent_depth = 2;
+
+        let tool = AgentTool::default();
+        let input = serde_json::json!({
+            "description": "Test",
+            "prompt": "Do something",
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("recursion depth"));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_run_in_background_is_not_implemented() {
+        let cwd = temp_dir("agent-bg");
+        let mut ctx = ctx_for(cwd);
+        let tool = AgentTool::default();
+
+        let input = serde_json::json!({
+            "description": "Test",
+            "prompt": "Do something",
+            "run_in_background": true,
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("run_in_background"));
+    }
+
+    struct FakeAgent;
+
+    #[async_trait]
+    impl crate::AgentExecutor for FakeAgent {
+        async fn run_agent(
+            &self,
+            description: Option<String>,
+            prompt: String,
+            depth: u32,
+        ) -> anyhow::Result<String> {
+            Ok(format!(
+                "fake agent ok: desc={:?} prompt={} depth={}",
+                description, prompt, depth
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_tool_delegates_to_executor() {
+        let cwd = temp_dir("agent-ok");
+        let mut ctx = ctx_for(cwd);
+        ctx.agent = Some(Arc::new(FakeAgent));
+
+        let tool = AgentTool::default();
+        let input = serde_json::json!({
+            "description": "Unit test",
+            "prompt": "Hello",
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("fake agent ok"));
+        assert!(out.contains("Hello"));
+        assert!(out.contains("depth=1"));
+    }
+}

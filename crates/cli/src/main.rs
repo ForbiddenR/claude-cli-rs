@@ -28,7 +28,8 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
-#[tokio::main]
+// Week 8: prefer a single-threaded runtime for lower startup overhead in a CLI.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
 

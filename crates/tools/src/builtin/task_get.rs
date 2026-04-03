@@ -84,3 +84,58 @@ impl Tool for TaskGetTool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::Default,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn task_get_returns_not_found_for_missing_task() {
+        let cwd = temp_dir("task-get");
+        let mut ctx = ctx_for(cwd);
+        let tool = TaskGetTool::default();
+
+        let input = serde_json::json!({ "taskId": "does-not-exist" });
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+        assert_eq!(res.content.as_str().unwrap_or_default(), "Task not found");
+    }
+
+    #[tokio::test]
+    async fn task_get_requires_task_id() {
+        let cwd = temp_dir("task-get-missing");
+        let mut ctx = ctx_for(cwd);
+        let tool = TaskGetTool::default();
+
+        let input = serde_json::json!({ "taskId": "" });
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+    }
+}

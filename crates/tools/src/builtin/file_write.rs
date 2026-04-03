@@ -121,3 +121,95 @@ fn write_file(path: PathBuf, content: &str) -> anyhow::Result<String> {
     let kind = if existed { "updated" } else { "created" };
     Ok(format!("Wrote {} ({kind}, {bytes} bytes)", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf, mode: PermissionMode) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: mode,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_creates_file_under_cwd() {
+        let cwd = temp_dir("write-cwd");
+        let mut ctx = ctx_for(cwd.clone(), PermissionMode::AcceptEdits);
+
+        let tool = WriteTool::default();
+        let abs_path = cwd.join("sub").join("hello.txt");
+
+        let input = serde_json::json!({
+            "file_path": "sub/hello.txt",
+            "content": "hi",
+        });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&abs_path).expect("read written file"),
+            "hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_is_denied_outside_cwd_in_non_bypass() {
+        let cwd = temp_dir("write-deny");
+        let ctx = ctx_for(cwd.clone(), PermissionMode::AcceptEdits);
+
+        let tool = WriteTool::default();
+        let outside_dir = temp_dir("write-outside");
+        let outside_file = outside_dir.join("outside.txt");
+        let input = serde_json::json!({
+            "file_path": outside_file.to_string_lossy().to_string(),
+            "content": "x",
+        });
+
+        assert!(!tool.check_permissions(&input, &ctx).await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn bypass_permissions_allows_write_outside_cwd() {
+        let cwd = temp_dir("write-bypass");
+        let mut ctx = ctx_for(cwd.clone(), PermissionMode::BypassPermissions);
+
+        let tool = WriteTool::default();
+        let outside_dir = temp_dir("write-bypass-outside");
+        let outside_file = outside_dir.join("outside.txt");
+        let input = serde_json::json!({
+            "file_path": outside_file.to_string_lossy().to_string(),
+            "content": "ok",
+        });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).expect("read written file"),
+            "ok"
+        );
+    }
+}

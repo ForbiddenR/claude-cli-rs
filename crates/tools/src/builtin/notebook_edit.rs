@@ -317,3 +317,100 @@ fn write_notebook(path: &PathBuf, notebook: &serde_json::Value) -> anyhow::Resul
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::AcceptEdits,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn notebook_edit_replaces_cell_source() {
+        let cwd = temp_dir("notebook-edit");
+        let mut ctx = ctx_for(cwd.clone());
+        let tool = NotebookEditTool::default();
+
+        let path = cwd.join("test.ipynb");
+        let nb = serde_json::json!({
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "id": "abc",
+                    "source": "print(1)",
+                    "metadata": {},
+                    "execution_count": serde_json::Value::Null,
+                    "outputs": [],
+                }
+            ],
+            "metadata": { "language_info": { "name": "python" } },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        });
+        std::fs::write(&path, serde_json::to_string(&nb).unwrap()).expect("write notebook");
+
+        let input = serde_json::json!({
+            "notebook_path": path.to_string_lossy().to_string(),
+            "cell_id": "abc",
+            "new_source": "print(2)",
+            "edit_mode": "replace",
+        });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let updated = std::fs::read_to_string(&path).expect("read notebook");
+        assert!(updated.contains("print(2)"));
+    }
+
+    #[tokio::test]
+    async fn notebook_edit_insert_requires_cell_type() {
+        let cwd = temp_dir("notebook-insert");
+        let mut ctx = ctx_for(cwd.clone());
+        let tool = NotebookEditTool::default();
+
+        let path = cwd.join("test.ipynb");
+        let nb = serde_json::json!({
+            "cells": [],
+            "metadata": { "language_info": { "name": "python" } },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        });
+        std::fs::write(&path, serde_json::to_string(&nb).unwrap()).expect("write notebook");
+
+        let input = serde_json::json!({
+            "notebook_path": path.to_string_lossy().to_string(),
+            "new_source": "print(1)",
+            "edit_mode": "insert",
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("cell_type"));
+    }
+}

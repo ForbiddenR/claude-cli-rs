@@ -447,3 +447,84 @@ fn apply_limit(items: Vec<String>, head_limit: usize, offset: usize) -> (Vec<Str
     let shown = items.into_iter().take(head_limit).collect();
     (shown, truncated)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf, mode: PermissionMode) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: mode,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_files_with_matches_lists_files() {
+        let cwd = temp_dir("grep-files");
+        std::fs::create_dir_all(cwd.join("sub")).expect("mkdir");
+        std::fs::write(cwd.join("file1.txt"), "hello world\n").expect("write file1");
+        std::fs::write(cwd.join("file2.txt"), "nope\n").expect("write file2");
+        std::fs::write(cwd.join("sub").join("file3.txt"), "HELLO\n").expect("write file3");
+
+        let mut ctx = ctx_for(cwd.clone(), PermissionMode::Default);
+        let tool = GrepTool::default();
+        let input = serde_json::json!({
+            "pattern": "hello",
+            "-i": true,
+            "output_mode": "files_with_matches",
+        });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("file1.txt"));
+        assert!(out.contains("file3.txt"));
+        assert!(!out.contains("file2.txt"));
+    }
+
+    #[tokio::test]
+    async fn grep_content_includes_line_matches() {
+        let cwd = temp_dir("grep-content");
+        std::fs::create_dir_all(cwd.join("sub")).expect("mkdir");
+        std::fs::write(cwd.join("file1.txt"), "hello world\n").expect("write file1");
+        std::fs::write(cwd.join("sub").join("file3.txt"), "HELLO\n").expect("write file3");
+
+        let mut ctx = ctx_for(cwd.clone(), PermissionMode::Default);
+        let tool = GrepTool::default();
+        let input = serde_json::json!({
+            "pattern": "hello",
+            "-i": true,
+            "output_mode": "content",
+            "head_limit": 0,
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("file1.txt:1:hello world"));
+        assert!(out.contains("file3.txt:1:HELLO"));
+    }
+}

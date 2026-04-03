@@ -59,3 +59,80 @@ impl Tool for TaskStopTool {
         Ok(ToolResult::ok_text(format!("Stopped task: #{id}")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtin::TaskCreateTool;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::Default,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    async fn create_task(ctx: &mut ToolUseContext) -> String {
+        let create = TaskCreateTool::default();
+        let _ = create
+            .call(
+                serde_json::json!({
+                    "subject": "Stop me",
+                    "description": "Please",
+                }),
+                ctx,
+            )
+            .await
+            .expect("create");
+
+        let guard = ctx.session.tasks.lock().await;
+        guard.keys().next().cloned().expect("task id")
+    }
+
+    #[tokio::test]
+    async fn task_stop_requires_task_id() {
+        let cwd = temp_dir("task-stop-missing");
+        let mut ctx = ctx_for(cwd);
+        let tool = TaskStopTool::default();
+        let res = tool.call(serde_json::json!({}), &mut ctx).await.expect("call");
+        assert!(res.is_error);
+    }
+
+    #[tokio::test]
+    async fn task_stop_sets_status_stopped() {
+        let cwd = temp_dir("task-stop");
+        let mut ctx = ctx_for(cwd);
+        let id = create_task(&mut ctx).await;
+
+        let tool = TaskStopTool::default();
+        let res = tool
+            .call(serde_json::json!({ "task_id": id.clone() }), &mut ctx)
+            .await
+            .expect("call");
+        assert!(!res.is_error);
+
+        let guard = ctx.session.tasks.lock().await;
+        let task = guard.get(&id).expect("task");
+        assert_eq!(task.status, TaskStatus::Stopped);
+    }
+}

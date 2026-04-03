@@ -162,3 +162,71 @@ fn glob_search(cwd: &Path, root: &Path, pattern: &str, limit: usize) -> anyhow::
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf, mode: PermissionMode) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: mode,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_finds_matching_files() {
+        let cwd = temp_dir("glob");
+        std::fs::create_dir_all(cwd.join("sub")).expect("mkdir");
+        std::fs::write(cwd.join("a.rs"), "fn a() {}\n").expect("write a.rs");
+        std::fs::write(cwd.join("b.txt"), "hello\n").expect("write b.txt");
+        std::fs::write(cwd.join("sub").join("c.rs"), "fn c() {}\n").expect("write c.rs");
+
+        let mut ctx = ctx_for(cwd.clone(), PermissionMode::Default);
+        let tool = GlobTool::default();
+        let input = serde_json::json!({ "pattern": "**/*.rs" });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("a.rs"));
+        assert!(out.contains("c.rs"));
+        assert!(!out.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn glob_is_denied_outside_allowed_roots() {
+        let cwd = temp_dir("glob-cwd");
+        let outside = temp_dir("glob-outside");
+
+        let ctx = ctx_for(cwd.clone(), PermissionMode::Default);
+        let tool = GlobTool::default();
+        let input = serde_json::json!({
+            "pattern": "**/*",
+            "path": outside.to_string_lossy().to_string(),
+        });
+
+        assert!(!tool.check_permissions(&input, &ctx).await.is_allowed());
+    }
+}

@@ -193,3 +193,71 @@ async fn read_stream_limited<R: AsyncReadExt + Unpin>(r: &mut R, limit: usize, o
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf, mode: PermissionMode) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: mode,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_echo_includes_stdout() {
+        let cwd = temp_dir("bash-echo");
+        let mut ctx = ctx_for(cwd, PermissionMode::BypassPermissions);
+
+        let tool = BashTool::default();
+        let input = serde_json::json!({ "command": "echo hello" });
+
+        assert!(tool.check_permissions(&input, &ctx).await.is_allowed());
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("[stdout]"));
+        assert!(out.to_ascii_lowercase().contains("hello"));
+        assert!(out.contains("[exit_code]"));
+        assert!(out.contains("\n0\n"));
+    }
+
+    #[tokio::test]
+    async fn bash_run_in_background_is_not_implemented() {
+        let cwd = temp_dir("bash-bg");
+        let mut ctx = ctx_for(cwd, PermissionMode::BypassPermissions);
+
+        let tool = BashTool::default();
+        let input = serde_json::json!({
+            "command": "echo hello",
+            "run_in_background": true,
+        });
+
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("run_in_background"));
+    }
+}

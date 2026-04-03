@@ -77,3 +77,87 @@ impl Tool for TaskOutputTool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtin::TaskCreateTool;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::Default,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    async fn create_task(ctx: &mut ToolUseContext) -> String {
+        let create = TaskCreateTool::default();
+        let _ = create
+            .call(
+                serde_json::json!({
+                    "subject": "Output task",
+                    "description": "test",
+                }),
+                ctx,
+            )
+            .await
+            .expect("create");
+
+        let guard = ctx.session.tasks.lock().await;
+        guard.keys().next().cloned().expect("task id")
+    }
+
+    #[tokio::test]
+    async fn task_output_requires_task_id() {
+        let cwd = temp_dir("task-output-missing");
+        let mut ctx = ctx_for(cwd);
+        let tool = TaskOutputTool::default();
+        let res = tool.call(serde_json::json!({}), &mut ctx).await.expect("call");
+        assert!(res.is_error);
+    }
+
+    #[tokio::test]
+    async fn task_output_includes_output_lines_when_present() {
+        let cwd = temp_dir("task-output");
+        let mut ctx = ctx_for(cwd);
+        let id = create_task(&mut ctx).await;
+
+        {
+            let mut guard = ctx.session.tasks.lock().await;
+            let task = guard.get_mut(&id).expect("task");
+            task.output.push("line one".to_string());
+            task.output.push("line two".to_string());
+        }
+
+        let tool = TaskOutputTool::default();
+        let res = tool
+            .call(serde_json::json!({ "task_id": id }), &mut ctx)
+            .await
+            .expect("call");
+        assert!(!res.is_error);
+        let out = res.content.as_str().unwrap_or_default();
+        assert!(out.contains("Output:"));
+        assert!(out.contains("line one"));
+        assert!(out.contains("line two"));
+    }
+}

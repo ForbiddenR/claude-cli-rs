@@ -1,6 +1,8 @@
-# claude-cli-rs (Weeks 1–7)
+# claude-cli-rs (Weeks 1–8)
 
 This folder contains the Rust rewrite workspace for the **headless/CLI-only** mode.
+
+For a TypeScript CLI -> Rust CLI mapping, see `MIGRATION.md`.
 
 ## Quick Start
 
@@ -135,3 +137,4 @@ cargo run -p claude-cli -- mcp remove --scope local github
 - Week 4 adds a minimal **tool framework** + built-in `Bash/Read/Write/Edit/Glob/Grep`.
 - Week 6 adds **session persistence/resume** and **context compaction**.
 - Week 7 adds **stdin piping**, friendlier **error hints**, and cross-platform CI + integration tests.
+- Week 8 adds expanded **tool tests**, additional **integration tests** (tool-use + `--continue`), and a migration guide.

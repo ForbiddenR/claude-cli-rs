@@ -105,3 +105,69 @@ impl Tool for TodoWriteTool {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::permissions::PermissionMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claude-tools-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn ctx_for(cwd: PathBuf) -> ToolUseContext {
+        let store_dir = cwd.join(".claude-tools-test-results");
+        ToolUseContext {
+            cwd: cwd.clone(),
+            allowed_roots: vec![cwd],
+            permission_mode: PermissionMode::Default,
+            session: Arc::new(crate::SessionState::default()),
+            result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
+            agent: None,
+            agent_depth: 0,
+            max_agent_depth: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn todo_write_updates_and_clears_when_all_completed() {
+        let cwd = temp_dir("todos");
+        let mut ctx = ctx_for(cwd);
+        let tool = TodoWriteTool::default();
+
+        let input = serde_json::json!({
+            "todos": [
+                { "content": "One", "status": "pending", "activeForm": "Doing one" },
+                { "content": "Two", "status": "in_progress", "activeForm": "Doing two" },
+            ]
+        });
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        {
+            let guard = ctx.session.todos.lock().await;
+            assert_eq!(guard.len(), 2);
+            assert_eq!(guard[0].content, "One");
+        }
+
+        let input = serde_json::json!({
+            "todos": [
+                { "content": "One", "status": "completed", "activeForm": "Done one" },
+                { "content": "Two", "status": "completed", "activeForm": "Done two" },
+            ]
+        });
+        let res = tool.call(input, &mut ctx).await.expect("call");
+        assert!(!res.is_error);
+
+        let guard = ctx.session.todos.lock().await;
+        assert_eq!(guard.len(), 0);
+    }
+}

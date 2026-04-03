@@ -182,3 +182,65 @@ fn collect_ddg_hits(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_allowed_respects_allow_and_block_lists() {
+        assert!(domain_allowed(
+            "https://example.com/path",
+            &[],
+            &[]
+        ));
+
+        assert!(!domain_allowed(
+            "https://example.com/path",
+            &[],
+            &["example.com".to_string()]
+        ));
+
+        assert!(!domain_allowed(
+            "https://example.com/path",
+            &["allowed.com".to_string()],
+            &[]
+        ));
+
+        assert!(domain_allowed(
+            "https://example.com/path",
+            &["example.com".to_string()],
+            &[]
+        ));
+
+        // Blocking a parent domain blocks subdomains as well.
+        assert!(!domain_allowed(
+            "https://sub.example.com/path",
+            &[],
+            &["example.com".to_string()]
+        ));
+    }
+
+    #[test]
+    fn collect_ddg_hits_collects_results_and_related_topics() {
+        let json = serde_json::json!({
+            "Results": [
+                { "FirstURL": "https://a.example/a", "Text": "A result" }
+            ],
+            "RelatedTopics": [
+                { "FirstURL": "https://b.example/b", "Text": "B result" },
+                { "Topics": [
+                    { "FirstURL": "https://c.example/c", "Text": "C result" }
+                ]}
+            ]
+        });
+
+        let mut hits = Vec::new();
+        collect_ddg_hits(&json, &mut hits);
+
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().any(|(t, u)| t == "A result" && u == "https://a.example/a"));
+        assert!(hits.iter().any(|(t, u)| t == "B result" && u == "https://b.example/b"));
+        assert!(hits.iter().any(|(t, u)| t == "C result" && u == "https://c.example/c"));
+    }
+}
