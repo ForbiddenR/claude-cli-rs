@@ -24,6 +24,20 @@ pub enum ThinkingMode {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SettingsScope {
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum McpTransport {
+    Stdio,
+    Sse,
+    Ws,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "claude-rs", about = "Claude Code (headless) rewritten in Rust")]
 pub struct Args {
@@ -180,10 +194,73 @@ pub struct Args {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// OAuth login (manual PKCE flow).
-    Auth,
-    /// Diagnostics (stub).
+    /// Authentication helpers.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Diagnostics.
     Doctor,
-    /// MCP config helpers (stub).
-    Mcp,
+    /// Manage MCP servers.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// OAuth login (manual PKCE flow).
+    Login,
+    /// Clear stored credentials from global config.
+    Logout,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// List MCP servers in a settings scope.
+    List {
+        /// Configuration scope (local, project, user).
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = SettingsScope::Local)]
+        scope: SettingsScope,
+    },
+    /// Add or update an MCP server in a settings scope.
+    Add {
+        /// Server name.
+        name: String,
+        /// Command (stdio) or URL (sse/ws).
+        command_or_url: String,
+        /// Args for the stdio command (pass `--` before args).
+        args: Vec<String>,
+
+        /// Configuration scope (local, project, user).
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = SettingsScope::Local)]
+        scope: SettingsScope,
+
+        /// Transport type (stdio, sse, ws).
+        #[arg(
+            short = 't',
+            long = "transport",
+            value_enum,
+            default_value_t = McpTransport::Stdio
+        )]
+        transport: McpTransport,
+
+        /// Environment variables (stdio) as KEY=value (repeatable).
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+
+        /// Headers (sse/ws) as "Key: Value" (repeatable).
+        #[arg(short = 'H', long = "header")]
+        header: Vec<String>,
+    },
+    /// Remove an MCP server from a settings scope.
+    Remove {
+        /// Server name.
+        name: String,
+
+        /// Configuration scope (local, project, user).
+        #[arg(short = 's', long = "scope", value_enum, default_value_t = SettingsScope::Local)]
+        scope: SettingsScope,
+    },
 }

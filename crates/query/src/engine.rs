@@ -71,6 +71,9 @@ pub struct RunResult {
     pub cost_usd: Option<f64>,
     pub turns: u32,
     pub model: String,
+    pub stop_reason: Option<StopReason>,
+    pub history: Vec<Message>,
+    pub new_messages: Vec<Message>,
 }
 
 impl QueryEngine {
@@ -98,7 +101,23 @@ impl QueryEngine {
     }
 
     /// Runs a one-shot headless session. The callback receives raw SSE event JSON.
-    pub async fn run<F>(&self, prompt: &str, mut on_event: F) -> anyhow::Result<RunResult>
+    pub async fn run<F>(&self, prompt: &str, on_event: F) -> anyhow::Result<RunResult>
+    where
+        F: FnMut(&serde_json::Value) -> anyhow::Result<()> + Send,
+    {
+        let history: Vec<Message> = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+        })];
+        self.run_with_history(history, on_event).await
+    }
+
+    pub async fn run_with_history<F>(
+        &self,
+        mut history: Vec<Message>,
+        mut on_event: F,
+    ) -> anyhow::Result<RunResult>
     where
         F: FnMut(&serde_json::Value) -> anyhow::Result<()> + Send,
     {
@@ -141,11 +160,9 @@ impl QueryEngine {
             })
             .collect::<Vec<_>>();
 
-        let mut history: Vec<Message> = vec![Message::User(UserMessage {
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
-        })];
+        let tool_defs_json_len = serde_json::to_string(&tool_defs)
+            .map(|s| s.len())
+            .unwrap_or_default();
 
         let max_turns = self.cfg.max_turns.max(1);
         let mut turns: u32 = 0;
@@ -153,6 +170,8 @@ impl QueryEngine {
         let mut combined_usage = TokenUsage::default();
         let mut combined_cost: Option<f64> = Some(0.0);
         let mut resolved_model: Option<String> = None;
+        let mut new_messages: Vec<Message> = Vec::new();
+        let mut last_stop_reason: Option<StopReason> = None;
 
         let session = Arc::new(SessionState::default());
         let (result_store, result_dir) = create_result_store(&self.cfg.cwd);
@@ -181,8 +200,19 @@ impl QueryEngine {
             max_agent_depth: self.cfg.max_agent_depth,
         };
 
+        let mut did_reactive_compact: bool = false;
+
         loop {
             turns += 1;
+
+            maybe_proactive_compact(
+                self,
+                &mut history,
+                &system,
+                tool_defs_json_len,
+                self.max_tokens,
+            )
+            .await;
 
             let req = MessagesRequest {
                 model: self.model.clone(),
@@ -195,7 +225,8 @@ impl QueryEngine {
 
             let mut parser = StreamParser::default();
 
-            self.client
+            let stream_res = self
+                .client
                 .stream_messages(&self.auth, &req, &mut |raw| {
                     on_event(&raw).map_err(|e| ServicesError::Callback {
                         detail: e.to_string(),
@@ -208,7 +239,23 @@ impl QueryEngine {
                         })?;
                     Ok(())
                 })
-                .await?;
+                .await;
+
+            if let Err(err) = stream_res {
+                if is_prompt_too_long_error(&err) && !did_reactive_compact {
+                    did_reactive_compact = true;
+                    maybe_reactive_compact(
+                        self,
+                        &mut history,
+                        &system,
+                        tool_defs_json_len,
+                        self.max_tokens,
+                    )
+                    .await;
+                    continue;
+                }
+                return Err(err.into());
+            }
 
             let parsed = parser.finish();
             resolved_model = parsed.model.or(resolved_model);
@@ -249,21 +296,26 @@ impl QueryEngine {
             combined_text.push_str(&parsed.text);
 
             // Push assistant message (without response-only fields) into the request history.
-            history.push(Message::Assistant(AssistantMessage {
+            let assistant_msg = Message::Assistant(AssistantMessage {
                 content: parsed.message.content.clone(),
                 model: None,
                 stop_reason: None,
                 usage: None,
-            }));
+            });
+            history.push(assistant_msg.clone());
+            new_messages.push(assistant_msg);
 
-            let stop_reason = parsed.message.stop_reason;
+            let stop_reason = parsed.message.stop_reason.or(last_stop_reason);
+            last_stop_reason = stop_reason;
 
             if stop_reason == Some(StopReason::MaxTokens) && turns < max_turns {
-                history.push(Message::User(UserMessage {
+                let continue_msg = Message::User(UserMessage {
                     content: vec![ContentBlock::Text {
                         text: "Continue.".to_string(),
                     }],
-                }));
+                });
+                history.push(continue_msg.clone());
+                new_messages.push(continue_msg);
                 continue;
             }
 
@@ -322,9 +374,9 @@ impl QueryEngine {
                     tool_results
                 };
 
-                history.push(Message::User(UserMessage {
-                    content: tool_results,
-                }));
+                let tool_results_msg = Message::User(UserMessage { content: tool_results });
+                history.push(tool_results_msg.clone());
+                new_messages.push(tool_results_msg);
                 continue;
             }
 
@@ -339,6 +391,9 @@ impl QueryEngine {
             cost_usd: combined_cost,
             turns,
             model,
+            stop_reason: last_stop_reason,
+            history,
+            new_messages,
         })
     }
 }
@@ -522,6 +577,329 @@ fn create_result_store(cwd: &PathBuf) -> (Arc<ToolResultStore>, PathBuf) {
             }
         }
     }
+}
+
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+const ONE_M_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+
+const AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
+const REACTIVE_COMPACT_BUFFER_TOKENS: u64 = 20_000;
+
+const COMPACT_KEEP_TAIL_MESSAGES: usize = 20;
+const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2048;
+const COMPACT_MAX_TRANSCRIPT_CHARS: usize = 180_000;
+
+async fn maybe_proactive_compact(
+    engine: &QueryEngine,
+    history: &mut Vec<Message>,
+    system: &str,
+    tool_defs_json_len: usize,
+    max_tokens: u32,
+) {
+    if is_env_truthy("DISABLE_COMPACT") || is_env_truthy("DISABLE_AUTO_COMPACT") {
+        return;
+    }
+
+    let context_window = context_window_for_model(&engine.model);
+    let threshold = context_window
+        .saturating_sub(AUTOCOMPACT_BUFFER_TOKENS)
+        .saturating_sub(max_tokens as u64);
+
+    let est = estimate_request_tokens(system, tool_defs_json_len, history);
+    if est <= threshold {
+        return;
+    }
+
+    match compact_history(engine, history, COMPACT_KEEP_TAIL_MESSAGES, COMPACT_SUMMARY_MAX_TOKENS)
+        .await
+    {
+        Ok(new_hist) => *history = new_hist,
+        Err(_err) => hard_truncate_history(history, COMPACT_KEEP_TAIL_MESSAGES),
+    }
+
+    // If we're still estimated over budget, truncate more aggressively.
+    let est2 = estimate_request_tokens(system, tool_defs_json_len, history);
+    if est2 > threshold {
+        hard_truncate_history(history, 8);
+    }
+}
+
+async fn maybe_reactive_compact(
+    engine: &QueryEngine,
+    history: &mut Vec<Message>,
+    system: &str,
+    tool_defs_json_len: usize,
+    max_tokens: u32,
+) {
+    if is_env_truthy("DISABLE_COMPACT") {
+        return;
+    }
+
+    let context_window = context_window_for_model(&engine.model);
+    let threshold = context_window
+        .saturating_sub(REACTIVE_COMPACT_BUFFER_TOKENS)
+        .saturating_sub(max_tokens as u64);
+
+    // First try a real summary-based compaction.
+    match compact_history(engine, history, COMPACT_KEEP_TAIL_MESSAGES, COMPACT_SUMMARY_MAX_TOKENS)
+        .await
+    {
+        Ok(new_hist) => *history = new_hist,
+        Err(_err) => hard_truncate_history(history, COMPACT_KEEP_TAIL_MESSAGES),
+    }
+
+    // If still too large, keep trimming until we're under the threshold or out of history.
+    let mut est = estimate_request_tokens(system, tool_defs_json_len, history);
+    let mut keep = 12usize;
+    while est > threshold && history.len() > keep && keep > 1 {
+        hard_truncate_history(history, keep);
+        keep = keep.saturating_sub(2);
+        est = estimate_request_tokens(system, tool_defs_json_len, history);
+    }
+}
+
+fn hard_truncate_history(history: &mut Vec<Message>, keep_tail: usize) {
+    if history.len() <= keep_tail {
+        return;
+    }
+
+    let tail_start = history.len().saturating_sub(keep_tail);
+    let tail = history.split_off(tail_start);
+    history.clear();
+
+    history.push(Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: "[Conversation history truncated due to length.]".to_string(),
+        }],
+    }));
+
+    history.extend(tail);
+}
+
+async fn compact_history(
+    engine: &QueryEngine,
+    history: &[Message],
+    keep_tail: usize,
+    summary_max_tokens: u32,
+) -> anyhow::Result<Vec<Message>> {
+    if history.len() <= keep_tail + 2 {
+        return Ok(history.to_vec());
+    }
+
+    let split = history.len().saturating_sub(keep_tail.max(1));
+    let (head, tail) = history.split_at(split);
+
+    let mut transcript = render_messages_for_summary(head);
+    if transcript.chars().count() > COMPACT_MAX_TRANSCRIPT_CHARS {
+        transcript = truncate_tail_chars(&transcript, COMPACT_MAX_TRANSCRIPT_CHARS);
+    }
+
+    let mut prompt = String::new();
+    prompt.push_str("Summarize the conversation so far for future context.\n");
+    prompt.push_str("- Focus on key decisions, constraints, file changes, commands, errors, and TODOs.\n");
+    prompt.push_str("- Be concise but include details needed to continue.\n");
+    prompt.push_str("- Output plain text (no Markdown code fences).\n\n");
+    prompt.push_str("# Conversation\n\n");
+    prompt.push_str(&transcript);
+
+    let req = MessagesRequest {
+        model: engine.model.clone(),
+        max_tokens: summary_max_tokens.max(256),
+        system: Some("You are a summarizer. Return only the summary text.".to_string()),
+        tools: None,
+        messages: vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: prompt }],
+        })],
+        stream: true,
+    };
+
+    let mut parser = StreamParser::default();
+
+    // If the summary request itself hits prompt-too-long, progressively truncate input and retry.
+    let mut attempt: u32 = 0;
+    let mut req = req;
+    loop {
+        attempt += 1;
+        let res = engine
+            .client
+            .stream_messages(&engine.auth, &req, &mut |raw| {
+                parser
+                    .process_event(&raw)
+                    .map_err(|e| ServicesError::Callback {
+                        detail: e.to_string(),
+                    })?;
+                Ok(())
+            })
+            .await;
+
+        match res {
+            Ok(()) => break,
+            Err(err) if is_prompt_too_long_error(&err) && attempt < 4 => {
+                // Chop transcript further and retry.
+                let truncated = truncate_tail_chars(
+                    &transcript,
+                    (COMPACT_MAX_TRANSCRIPT_CHARS / (attempt as usize + 1)).max(20_000),
+                );
+
+                let mut prompt = String::new();
+                prompt.push_str("Summarize the conversation so far for future context.\n");
+                prompt.push_str("- Focus on key decisions, constraints, file changes, commands, errors, and TODOs.\n");
+                prompt.push_str("- Be concise but include details needed to continue.\n");
+                prompt.push_str("- Output plain text (no Markdown code fences).\n\n");
+                prompt.push_str("# Conversation (truncated)\n\n");
+                prompt.push_str(&truncated);
+
+                req.messages = vec![Message::User(UserMessage {
+                    content: vec![ContentBlock::Text { text: prompt }],
+                })];
+
+                parser = StreamParser::default();
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    let parsed = parser.finish();
+    let summary = parsed.text.trim();
+    if summary.is_empty() {
+        anyhow::bail!("compaction summary was empty");
+    }
+
+    let summary_msg = Message::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: format!("[Conversation summary]\n{summary}"),
+        }],
+    });
+
+    let mut new_history: Vec<Message> = Vec::new();
+    new_history.push(summary_msg);
+    new_history.extend_from_slice(tail);
+    Ok(new_history)
+}
+
+fn is_prompt_too_long_error(err: &ServicesError) -> bool {
+    match err {
+        ServicesError::ApiStatus { status, body } => {
+            // 413 is commonly used for payload too large; 400 is also seen.
+            if *status != 400 && *status != 413 {
+                return false;
+            }
+            let b = body.to_ascii_lowercase();
+            b.contains("prompt_too_long")
+                || b.contains("prompt too long")
+                || b.contains("context_length_exceeded")
+                || b.contains("too many tokens")
+        }
+        _ => false,
+    }
+}
+
+fn is_env_truthy(key: &str) -> bool {
+    let Ok(v) = std::env::var(key) else {
+        return false;
+    };
+    let v = v.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn context_window_for_model(model: &str) -> u64 {
+    if model.to_ascii_lowercase().contains("[1m]") {
+        return ONE_M_CONTEXT_WINDOW_TOKENS;
+    }
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+fn estimate_request_tokens(system: &str, tool_defs_json_len: usize, messages: &[Message]) -> u64 {
+    let mut chars: u64 = 0;
+    chars = chars.saturating_add(system.chars().count() as u64);
+    chars = chars.saturating_add(tool_defs_json_len as u64);
+
+    for m in messages {
+        chars = chars.saturating_add(estimate_message_chars(m));
+    }
+
+    // Heuristic: ~4 chars/token for English-ish text.
+    chars / 4
+}
+
+fn estimate_message_chars(m: &Message) -> u64 {
+    let blocks = match m {
+        Message::User(u) => &u.content,
+        Message::Assistant(a) => &a.content,
+    };
+
+    let mut chars: u64 = 20; // message wrapper overhead
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } => {
+                chars = chars.saturating_add(text.chars().count() as u64);
+            }
+            ContentBlock::Thinking { thinking } => {
+                chars = chars.saturating_add(thinking.chars().count() as u64);
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                chars = chars.saturating_add(name.len() as u64);
+                let input_len = serde_json::to_string(input).map(|s| s.len()).unwrap_or(0);
+                chars = chars.saturating_add(input_len as u64);
+                chars = chars.saturating_add(50);
+            }
+            ContentBlock::ToolResult { content, .. } => {
+                let content_len = serde_json::to_string(content).map(|s| s.len()).unwrap_or(0);
+                chars = chars.saturating_add(content_len as u64);
+                chars = chars.saturating_add(50);
+            }
+        }
+    }
+    chars
+}
+
+fn render_messages_for_summary(messages: &[Message]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m {
+            Message::User(u) => {
+                out.push_str("[user]\n");
+                render_blocks_for_summary(&mut out, &u.content);
+            }
+            Message::Assistant(a) => {
+                out.push_str("[assistant]\n");
+                render_blocks_for_summary(&mut out, &a.content);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_blocks_for_summary(out: &mut String, blocks: &[ContentBlock]) {
+    for b in blocks {
+        match b {
+            ContentBlock::Text { text } => {
+                out.push_str(text.trim());
+                out.push('\n');
+            }
+            ContentBlock::Thinking { .. } => {
+                // Omit thinking blocks to reduce noise.
+            }
+            ContentBlock::ToolUse { name, .. } => {
+                out.push_str(&format!("[tool_use name={name}]\n"));
+            }
+            ContentBlock::ToolResult { is_error, .. } => {
+                out.push_str(&format!("[tool_result is_error={is_error}]\n"));
+            }
+        }
+    }
+}
+
+fn truncate_tail_chars(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_string();
+    }
+
+    let skip = len.saturating_sub(max_chars);
+    s.chars().skip(skip).collect()
 }
 
 #[derive(Clone)]

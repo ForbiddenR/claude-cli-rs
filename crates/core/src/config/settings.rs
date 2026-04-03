@@ -15,14 +15,16 @@ pub struct Settings {
 
     #[serde(
         default,
-        alias = "permissionMode",
+        rename = "permissionMode",
+        alias = "permission_mode",
         skip_serializing_if = "Option::is_none"
     )]
     pub permission_mode: Option<PermissionMode>,
 
     #[serde(
         default,
-        alias = "apiKeyHelper",
+        rename = "apiKeyHelper",
+        alias = "api_key_helper",
         skip_serializing_if = "Option::is_none"
     )]
     pub api_key_helper: Option<String>,
@@ -30,26 +32,34 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
 
-    #[serde(default, alias = "mcpServers", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "mcpServers",
+        alias = "mcp_servers",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
     #[serde(
         default,
-        alias = "allowedTools",
+        rename = "allowedTools",
+        alias = "allowed_tools",
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_tools: Option<Vec<String>>,
 
     #[serde(
         default,
-        alias = "disallowedTools",
+        rename = "disallowedTools",
+        alias = "disallowed_tools",
         skip_serializing_if = "Option::is_none"
     )]
     pub disallowed_tools: Option<Vec<String>>,
 
     #[serde(
         default,
-        alias = "customSystemPrompt",
+        rename = "customSystemPrompt",
+        alias = "custom_system_prompt",
         skip_serializing_if = "Option::is_none"
     )]
     pub custom_system_prompt: Option<String>,
@@ -114,9 +124,17 @@ impl Settings {
 }
 
 pub fn load_settings_file(path: &Path) -> Result<Settings> {
-    let bytes = fs::read(path).map_err(|_source| CoreError::ReadConfig {
-        path: path.to_path_buf(),
-    })?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Settings::default());
+        }
+        Err(_err) => {
+            return Err(CoreError::ReadConfig {
+                path: path.to_path_buf(),
+            });
+        }
+    };
 
     if bytes.is_empty() {
         return Ok(Settings::default());
@@ -124,6 +142,18 @@ pub fn load_settings_file(path: &Path) -> Result<Settings> {
 
     let cfg: Settings = serde_json::from_slice(&bytes)?;
     Ok(cfg)
+}
+
+pub fn save_settings_file(path: &Path, cfg: &Settings) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(cfg)?;
+    fs::write(path, bytes).map_err(|_source| CoreError::WriteConfig {
+        path: path.to_path_buf(),
+    })?;
+    Ok(())
 }
 
 /// Load a settings argument, which can be either:

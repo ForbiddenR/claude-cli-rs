@@ -54,3 +54,6 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # Web tools (Week 5)
 html2text = "0.6"
+
+# History + paste store (Week 6)
+sha2 = "0.10"
