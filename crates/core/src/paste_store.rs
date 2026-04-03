@@ -43,4 +43,3 @@ pub fn retrieve_pasted_text(hash: &str) -> Result<Option<String>> {
     };
     Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
 }
-

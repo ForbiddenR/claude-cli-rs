@@ -44,7 +44,7 @@ pub struct Args {
     /// Prompt to send. If omitted, stdin is read.
     pub prompt: Option<String>,
 
-    /// Print response and exit (required; interactive mode is not implemented).
+    /// Print response and exit (default when a prompt is provided or stdin is piped).
     #[arg(short = 'p', long = "print", default_value_t = false)]
     pub print: bool,
 
@@ -52,15 +52,15 @@ pub struct Args {
     #[arg(long = "bare", default_value_t = false)]
     pub bare: bool,
 
-    /// Output format (only works with --print).
+    /// Output format.
     #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
     pub output_format: OutputFormat,
 
-    /// JSON Schema for structured output (only works with --print).
+    /// JSON Schema for structured output.
     #[arg(long = "json-schema")]
     pub json_schema: Option<String>,
 
-    /// Input format (only works with --print).
+    /// Input format.
     #[arg(long = "input-format", value_enum, default_value_t = InputFormat::Text)]
     pub input_format: InputFormat,
 

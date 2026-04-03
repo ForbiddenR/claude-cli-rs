@@ -374,7 +374,9 @@ impl QueryEngine {
                     tool_results
                 };
 
-                let tool_results_msg = Message::User(UserMessage { content: tool_results });
+                let tool_results_msg = Message::User(UserMessage {
+                    content: tool_results,
+                });
                 history.push(tool_results_msg.clone());
                 new_messages.push(tool_results_msg);
                 continue;
@@ -610,8 +612,13 @@ async fn maybe_proactive_compact(
         return;
     }
 
-    match compact_history(engine, history, COMPACT_KEEP_TAIL_MESSAGES, COMPACT_SUMMARY_MAX_TOKENS)
-        .await
+    match compact_history(
+        engine,
+        history,
+        COMPACT_KEEP_TAIL_MESSAGES,
+        COMPACT_SUMMARY_MAX_TOKENS,
+    )
+    .await
     {
         Ok(new_hist) => *history = new_hist,
         Err(_err) => hard_truncate_history(history, COMPACT_KEEP_TAIL_MESSAGES),
@@ -641,8 +648,13 @@ async fn maybe_reactive_compact(
         .saturating_sub(max_tokens as u64);
 
     // First try a real summary-based compaction.
-    match compact_history(engine, history, COMPACT_KEEP_TAIL_MESSAGES, COMPACT_SUMMARY_MAX_TOKENS)
-        .await
+    match compact_history(
+        engine,
+        history,
+        COMPACT_KEEP_TAIL_MESSAGES,
+        COMPACT_SUMMARY_MAX_TOKENS,
+    )
+    .await
     {
         Ok(new_hist) => *history = new_hist,
         Err(_err) => hard_truncate_history(history, COMPACT_KEEP_TAIL_MESSAGES),
@@ -696,7 +708,9 @@ async fn compact_history(
 
     let mut prompt = String::new();
     prompt.push_str("Summarize the conversation so far for future context.\n");
-    prompt.push_str("- Focus on key decisions, constraints, file changes, commands, errors, and TODOs.\n");
+    prompt.push_str(
+        "- Focus on key decisions, constraints, file changes, commands, errors, and TODOs.\n",
+    );
     prompt.push_str("- Be concise but include details needed to continue.\n");
     prompt.push_str("- Output plain text (no Markdown code fences).\n\n");
     prompt.push_str("# Conversation\n\n");

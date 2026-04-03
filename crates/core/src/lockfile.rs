@@ -42,4 +42,3 @@ pub fn acquire_lock(path: &Path, timeout: Duration) -> Result<LockGuard> {
         }
     }
 }
-

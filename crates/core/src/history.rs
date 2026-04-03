@@ -122,10 +122,7 @@ pub fn append_session_messages(path: &Path, messages: &[Message]) -> Result<()> 
     }
 
     // Ensure file exists before locking.
-    let _ = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let _ = OpenOptions::new().create(true).append(true).open(path)?;
 
     let lock_path = lock_path_for(path);
     let _lock = crate::lockfile::acquire_lock(&lock_path, Duration::from_secs(5))?;
@@ -277,4 +274,3 @@ fn expand_paste_refs_in_text(text: &str, cache: &mut HashMap<String, Option<Stri
     out.push_str(rest);
     out
 }
-

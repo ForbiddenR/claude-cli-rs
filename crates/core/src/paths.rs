@@ -16,4 +16,3 @@ pub fn claude_config_home_dir() -> Result<PathBuf> {
 
     Ok(home.join(".claude"))
 }
-

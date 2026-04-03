@@ -8,7 +8,7 @@ pub enum PermissionMode {
     AcceptEdits,
 
     #[serde(rename = "bypassPermissions")]
-    #[value(name = "bypassPermissions")]
+    #[value(name = "bypassPermissions", alias = "bypass")]
     BypassPermissions,
 
     #[serde(rename = "default")]

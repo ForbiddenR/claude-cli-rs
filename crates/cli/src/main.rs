@@ -13,13 +13,33 @@ use claude_core::types::{
     message::{ContentBlock, Message, UserMessage},
 };
 use std::collections::HashMap;
+use std::io::IsTerminal as _;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+#[derive(Debug)]
+struct UsageError(String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     let args = Args::parse();
 
+    let res = run(&args).await;
+    if let Err(err) = res {
+        render_error(&args, &err);
+        std::process::exit(exit_code_for(&err));
+    }
+}
+
+async fn run(args: &Args) -> anyhow::Result<()> {
     if let Some(cwd) = &args.cwd {
         std::env::set_current_dir(cwd)
             .with_context(|| format!("setting --cwd to {}", cwd.display()))?;
@@ -43,22 +63,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             Command::Doctor => {
-                run_doctor(&args, &global_path, &mut global_cfg).await?;
+                run_doctor(args, &global_path, &mut global_cfg).await?;
                 return Ok(());
             }
             Command::Mcp { command } => {
-                run_mcp_command(&args, command).await?;
+                run_mcp_command(args, command).await?;
                 return Ok(());
             }
         }
     }
 
-    if !args.print {
-        eprintln!("interactive mode is not implemented in the Rust rewrite. Use -p/--print.");
-        std::process::exit(2);
-    }
-
-    let settings = load_effective_settings(&args)?;
+    let settings = load_effective_settings(args)?;
 
     // Apply env vars from settings early (Week 3+).
     if let Some(env) = &settings.env {
@@ -72,14 +87,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let prompt = match args.prompt.as_deref() {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let prompt = match args
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(p) => p.to_string(),
         None => {
+            // Avoid hanging if invoked without a prompt in an interactive terminal.
+            // If the user explicitly asked for print mode (`-p`), preserve the
+            // legacy behavior of reading stdin until EOF (Ctrl-D).
+            if stdin_is_tty && !args.print {
+                return Err(UsageError(
+                    "interactive mode is not implemented; pass a prompt (e.g. `claude-rs \"Hello\"`) or pipe stdin (e.g. `echo \"Hello\" | claude-rs`).\nTip: `claude-rs -p` will read stdin until EOF."
+                        .to_string(),
+                )
+                .into());
+            }
+
             let mut buf = String::new();
             tokio::io::stdin().read_to_string(&mut buf).await?;
             let buf = buf.trim().to_string();
             if buf.is_empty() {
-                anyhow::bail!("no prompt provided (pass a positional prompt or pipe stdin)");
+                return Err(UsageError(
+                    "no prompt provided (pass a positional prompt or pipe stdin)".to_string(),
+                )
+                .into());
             }
             buf
         }
@@ -110,6 +145,124 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    if find_in_chain::<UsageError>(err).is_some() {
+        return 2;
+    }
+    1
+}
+
+fn render_error(args: &Args, err: &anyhow::Error) {
+    if let Some(usage) = find_in_chain::<UsageError>(err) {
+        eprintln!("error: {}", usage.0);
+        eprintln!("hint: run `claude-rs --help` for usage.");
+        return;
+    }
+
+    if let Some(svc) = find_in_chain::<claude_services::ServicesError>(err) {
+        render_services_error(args, svc, err);
+        return;
+    }
+
+    if args.debug.is_some() {
+        eprintln!("error: {err:?}");
+    } else {
+        eprintln!("error: {err}");
+    }
+}
+
+fn render_services_error(args: &Args, svc: &claude_services::ServicesError, err: &anyhow::Error) {
+    use claude_services::ServicesError;
+
+    match svc {
+        ServicesError::MissingAuth { .. } => {
+            eprintln!("error: {svc}");
+            eprintln!(
+                "hint: set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN, or run `claude-rs auth login`."
+            );
+        }
+        ServicesError::OAuthExpired => {
+            eprintln!("error: {svc}");
+            eprintln!(
+                "hint: run `claude-rs auth login` to refresh OAuth, or set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN."
+            );
+        }
+        ServicesError::ApiKeyHelper { .. } => {
+            eprintln!("error: {svc}");
+            eprintln!(
+                "hint: check your settings `apiKeyHelper` or set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN."
+            );
+        }
+        ServicesError::ApiStatus { status, body } => {
+            let body = one_line_preview(body, 400);
+            if *status == 0 {
+                eprintln!("error: API request failed: {body}");
+            } else {
+                eprintln!("error: API request failed (HTTP {status})");
+                if !body.is_empty() {
+                    eprintln!("details: {body}");
+                }
+            }
+
+            match *status {
+                401 | 403 => {
+                    eprintln!(
+                        "hint: check ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, or re-run `claude-rs auth login`."
+                    );
+                }
+                404 | 405 => {
+                    let base = std::env::var("ANTHROPIC_BASE_URL")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                    eprintln!(
+                        "hint: check ANTHROPIC_BASE_URL (currently {base}); it must support POST /v1/messages."
+                    );
+                }
+                429 | 529 => {
+                    eprintln!(
+                        "hint: you're being rate limited / overloaded; retry later (the CLI retries a few times automatically)."
+                    );
+                }
+                _ => {}
+            }
+        }
+        ServicesError::Http { .. } | ServicesError::EventStream { .. } => {
+            eprintln!("error: {svc}");
+            eprintln!("hint: check network connectivity, proxy settings, and ANTHROPIC_BASE_URL.");
+        }
+        _ => {
+            if args.debug.is_some() {
+                eprintln!("error: {err:?}");
+            } else {
+                eprintln!("error: {svc}");
+            }
+        }
+    }
+
+    if args.debug.is_some() {
+        eprintln!("\n(debug) {err:?}");
+    }
+}
+
+fn find_in_chain<T: std::error::Error + 'static>(err: &anyhow::Error) -> Option<&T> {
+    err.chain().find_map(|e| e.downcast_ref::<T>())
+}
+
+fn one_line_preview(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let normalized = s
+        .chars()
+        .map(|ch| if ch.is_ascii_whitespace() { ' ' } else { ch })
+        .collect::<String>();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&collapsed, max_chars)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeadlessOutput {
     Text,
@@ -128,6 +281,7 @@ async fn run_headless(
     let client_for_hooks = client.clone();
     let auth_for_hooks = auth.clone();
     let model = resolve_model(args.model.clone(), settings.model.clone());
+    let mem_hook_enabled = !args.bare && is_env_truthy("CLAUDE_RS_EXTRACT_MEMORIES");
 
     let max_tokens = args.max_tokens.unwrap_or(1024);
     let max_turns = args.max_turns.unwrap_or(8);
@@ -220,6 +374,9 @@ async fn run_headless(
             )
             .await
             {
+                if mem_hook_enabled && args.debug.is_none() {
+                    eprintln!("warn: memory extraction stop hook failed: {err}");
+                }
                 log_warn_if_debug(args, format!("memory stop hook failed: {err}"));
             }
             Ok(())
@@ -249,6 +406,9 @@ async fn run_headless(
             )
             .await
             {
+                if mem_hook_enabled && args.debug.is_none() {
+                    eprintln!("warn: memory extraction stop hook failed: {err}");
+                }
                 log_warn_if_debug(args, format!("memory stop hook failed: {err}"));
             }
             Ok(())
@@ -270,6 +430,9 @@ async fn run_headless(
             )
             .await
             {
+                if mem_hook_enabled && args.debug.is_none() {
+                    eprintln!("warn: memory extraction stop hook failed: {err}");
+                }
                 log_warn_if_debug(args, format!("memory stop hook failed: {err}"));
             }
             Ok(())
