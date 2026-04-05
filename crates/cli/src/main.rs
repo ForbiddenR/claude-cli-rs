@@ -1,4 +1,5 @@
 mod args;
+mod tui;
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -97,15 +98,20 @@ async fn run(args: &Args) -> anyhow::Result<()> {
     {
         Some(p) => p.to_string(),
         None => {
-            // Avoid hanging if invoked without a prompt in an interactive terminal.
-            // If the user explicitly asked for print mode (`-p`), preserve the
-            // legacy behavior of reading stdin until EOF (Ctrl-D).
             if stdin_is_tty && !args.print {
-                return Err(UsageError(
-                    "interactive mode is not implemented; pass a prompt (e.g. `claude-rs \"Hello\"`) or pipe stdin (e.g. `echo \"Hello\" | claude-rs`).\nTip: `claude-rs -p` will read stdin until EOF."
-                        .to_string(),
+                let auth = claude_services::auth::resolve_auth(
+                    &global_path,
+                    &mut global_cfg,
+                    &settings,
+                    claude_services::auth::ResolveAuthOpts {
+                        cli_api_key: args.api_key.as_deref(),
+                        bare: args.bare,
+                    },
                 )
-                .into());
+                .await?;
+
+                tui::run_tui(args, &settings, auth).await?;
+                return Ok(());
             }
 
             let mut buf = String::new();

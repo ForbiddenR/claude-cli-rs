@@ -43,6 +43,10 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 url = "2"
 
+# TUI (TUI rewrite plan Week 1)
+ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.27", features = ["event-stream"] }
+
 # File system (Week 4)
 globwalk = "0.9"
 walkdir = "2"
