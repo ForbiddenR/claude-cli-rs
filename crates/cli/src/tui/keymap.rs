@@ -24,6 +24,9 @@ pub enum KeyAction {
     CompactChat,
     ShowHelp,
     ShowCost,
+    ShowModelPicker,
+    ResumeSession,
+    SearchTranscript,
 
     TypeaheadNext,
     TypeaheadPrev,
@@ -234,11 +237,22 @@ fn parse_action_name(raw: &str) -> Option<KeyAction> {
         "compact" | "compact_chat" | "compactchat" => Some(KeyAction::CompactChat),
         "help" => Some(KeyAction::ShowHelp),
         "cost" => Some(KeyAction::ShowCost),
+        "model" | "model_picker" | "show_model_picker" => Some(KeyAction::ShowModelPicker),
+        "resume" | "resume_session" | "resumesession" => Some(KeyAction::ResumeSession),
+        "search" | "find" | "search_transcript" | "searchtranscript" => {
+            Some(KeyAction::SearchTranscript)
+        }
         "typeahead_next" | "command_next" | "typeahead.next" => Some(KeyAction::TypeaheadNext),
         "typeahead_prev" | "command_prev" | "typeahead.prev" => Some(KeyAction::TypeaheadPrev),
-        "typeahead_accept" | "command_accept" | "typeahead.accept" => Some(KeyAction::TypeaheadAccept),
-        "typeahead_execute" | "command_execute" | "typeahead.execute" => Some(KeyAction::TypeaheadExecute),
-        "typeahead_dismiss" | "command_dismiss" | "typeahead.dismiss" => Some(KeyAction::TypeaheadDismiss),
+        "typeahead_accept" | "command_accept" | "typeahead.accept" => {
+            Some(KeyAction::TypeaheadAccept)
+        }
+        "typeahead_execute" | "command_execute" | "typeahead.execute" => {
+            Some(KeyAction::TypeaheadExecute)
+        }
+        "typeahead_dismiss" | "command_dismiss" | "typeahead.dismiss" => {
+            Some(KeyAction::TypeaheadDismiss)
+        }
         _ => None,
     }
 }

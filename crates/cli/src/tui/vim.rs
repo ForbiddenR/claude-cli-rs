@@ -47,16 +47,30 @@ pub enum VimHandleResult {
 enum NormalState {
     Idle,
     Count(String),
-    Operator { op: Operator, count: u32 },
-    OperatorCount { op: Operator, count: u32, digits: String },
+    Operator {
+        op: Operator,
+        count: u32,
+    },
+    OperatorCount {
+        op: Operator,
+        count: u32,
+        digits: String,
+    },
     OperatorTextObject {
         op: Operator,
         count: u32,
         scope: TextObjectScope,
     },
-    Replace { count: u32 },
-    G { count: u32 },
-    OperatorG { op: Operator, count: u32 },
+    Replace {
+        count: u32,
+    },
+    G {
+        count: u32,
+    },
+    OperatorG {
+        op: Operator,
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,13 +81,18 @@ enum InsertReplay {
     InsertLineEnd,
     OpenLineAbove,
     OpenLineBelow,
-    ChangeMotion { motion: Motion, count: u32 },
+    ChangeMotion {
+        motion: Motion,
+        count: u32,
+    },
     ChangeTextObject {
         object: char,
         scope: TextObjectScope,
         count: u32,
     },
-    ChangeLine { count: u32 },
+    ChangeLine {
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,16 +101,29 @@ enum RecordedChange {
         replay: InsertReplay,
         text: String,
     },
-    DeleteMotion { motion: Motion, count: u32 },
+    DeleteMotion {
+        motion: Motion,
+        count: u32,
+    },
     DeleteTextObject {
         object: char,
         scope: TextObjectScope,
         count: u32,
     },
-    DeleteLine { count: u32 },
-    X { count: u32 },
-    Replace { ch: char, count: u32 },
-    Paste { after: bool, count: u32 },
+    DeleteLine {
+        count: u32,
+    },
+    X {
+        count: u32,
+    },
+    Replace {
+        ch: char,
+        count: u32,
+    },
+    Paste {
+        after: bool,
+        count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +208,8 @@ impl VimMachine {
         }
 
         if let Some(replay) = self.insert_session.replay.take() {
-            let should_record = !self.insert_session.typed.is_empty() || replay.is_meaningful_with_empty_text();
+            let should_record =
+                !self.insert_session.typed.is_empty() || replay.is_meaningful_with_empty_text();
             if should_record {
                 self.last_change = Some(RecordedChange::Insert {
                     replay,
@@ -550,7 +583,11 @@ impl VimMachine {
         }
         let text = buffer.as_str();
         if self.register_linewise {
-            let lines = self.register.trim_end_matches('\n').split('\n').collect::<Vec<_>>();
+            let lines = self
+                .register
+                .trim_end_matches('\n')
+                .split('\n')
+                .collect::<Vec<_>>();
             if lines.is_empty() {
                 return;
             }
@@ -560,7 +597,11 @@ impl VimMachine {
                 .map(str::to_string)
                 .collect::<Vec<_>>();
             let current_line = line_number_at(text, buffer.cursor());
-            let insert_line = if after { current_line + 1 } else { current_line };
+            let insert_line = if after {
+                current_line + 1
+            } else {
+                current_line
+            };
             let mut all_lines = split_lines_preserve_empty(text);
             let idx = insert_line.min(all_lines.len());
             for (offset, line) in repeated.into_iter().enumerate() {
@@ -597,7 +638,9 @@ impl VimMachine {
         let mut line_end = line_start;
         let total_lines = split_lines_preserve_empty(&text).len();
         let current_line = line_number_at(&text, buffer.cursor());
-        let lines_to_affect = count.min(total_lines.saturating_sub(current_line) as u32).max(1);
+        let lines_to_affect = count
+            .min(total_lines.saturating_sub(current_line) as u32)
+            .max(1);
 
         for _ in 0..lines_to_affect {
             let end = line_end_exclusive(&text, line_end);
@@ -615,7 +658,10 @@ impl VimMachine {
             Operator::Delete => {
                 let mut delete_start = line_start;
                 let delete_end = line_end;
-                if delete_end == text.len() && delete_start > 0 && text.as_bytes()[delete_start - 1] == b'\n' {
+                if delete_end == text.len()
+                    && delete_start > 0
+                    && text.as_bytes()[delete_start - 1] == b'\n'
+                {
                     delete_start -= 1;
                 }
                 let mut new_text = String::new();
@@ -644,7 +690,13 @@ impl VimMachine {
         }
     }
 
-    fn execute_operator_motion(&mut self, op: Operator, motion: Motion, count: u32, buffer: &mut InputBuffer) {
+    fn execute_operator_motion(
+        &mut self,
+        op: Operator,
+        motion: Motion,
+        count: u32,
+        buffer: &mut InputBuffer,
+    ) {
         let text = buffer.as_str().to_string();
         let cursor = buffer.cursor();
         let Some(range) = operator_motion_range(&text, cursor, motion, count, op) else {
@@ -800,10 +852,22 @@ impl VimMachine {
             RecordedChange::DeleteMotion { motion, count } => {
                 self.execute_operator_motion(Operator::Delete, *motion, *count, buffer);
             }
-            RecordedChange::DeleteTextObject { object, scope, count } => {
-                self.execute_operator_text_object(Operator::Delete, *object, *scope, *count, buffer);
+            RecordedChange::DeleteTextObject {
+                object,
+                scope,
+                count,
+            } => {
+                self.execute_operator_text_object(
+                    Operator::Delete,
+                    *object,
+                    *scope,
+                    *count,
+                    buffer,
+                );
             }
-            RecordedChange::DeleteLine { count } => self.execute_line_op(Operator::Delete, *count, buffer),
+            RecordedChange::DeleteLine { count } => {
+                self.execute_line_op(Operator::Delete, *count, buffer)
+            }
             RecordedChange::X { count } => self.execute_x(*count, buffer),
             RecordedChange::Replace { ch, count } => self.execute_replace(*ch, *count, buffer),
             RecordedChange::Paste { after, count } => self.execute_paste(*after, *count, buffer),
@@ -827,7 +891,11 @@ impl VimMachine {
             }
             InsertReplay::OpenLineAbove => {
                 let at = line_start(buffer.as_str(), buffer.cursor());
-                let prefix = if at == 0 { String::new() } else { "\n".to_string() };
+                let prefix = if at == 0 {
+                    String::new()
+                } else {
+                    "\n".to_string()
+                };
                 let mut insert = prefix;
                 insert.push_str(text);
                 insert_text_at(buffer, at, &insert);
@@ -854,16 +922,27 @@ impl VimMachine {
             InsertReplay::ChangeMotion { motion, count } => {
                 let text_snapshot = buffer.as_str().to_string();
                 let cursor = buffer.cursor();
-                if let Some(range) = operator_motion_range(&text_snapshot, cursor, *motion, *count, Operator::Change) {
-                    self.set_register(text_snapshot[range.start..range.end].to_string(), range.linewise);
+                if let Some(range) =
+                    operator_motion_range(&text_snapshot, cursor, *motion, *count, Operator::Change)
+                {
+                    self.set_register(
+                        text_snapshot[range.start..range.end].to_string(),
+                        range.linewise,
+                    );
                     buffer.delete_range(range.start, range.end);
                     insert_text_at(buffer, range.start, text);
                 }
             }
-            InsertReplay::ChangeTextObject { object, scope, count: _ } => {
+            InsertReplay::ChangeTextObject {
+                object,
+                scope,
+                count: _,
+            } => {
                 let text_snapshot = buffer.as_str().to_string();
                 let cursor = buffer.cursor();
-                if let Some((start, end)) = find_text_object(&text_snapshot, cursor, *object, *scope) {
+                if let Some((start, end)) =
+                    find_text_object(&text_snapshot, cursor, *object, *scope)
+                {
                     self.set_register(text_snapshot[start..end].to_string(), false);
                     buffer.delete_range(start, end);
                     insert_text_at(buffer, start, text);
@@ -875,14 +954,23 @@ impl VimMachine {
                 let line_start = line_start(&text_snapshot, cursor);
                 let current_line = line_number_at(&text_snapshot, cursor);
                 let lines = split_lines_preserve_empty(&text_snapshot);
-                let lines_to_affect = (*count).min(lines.len().saturating_sub(current_line) as u32).max(1);
+                let lines_to_affect = (*count)
+                    .min(lines.len().saturating_sub(current_line) as u32)
+                    .max(1);
                 let before = &lines[..current_line];
                 let after = &lines[current_line + lines_to_affect as usize..];
                 let mut combined = Vec::with_capacity(before.len() + 1 + after.len());
                 combined.extend(before.iter().cloned());
                 combined.push(text.to_string());
                 combined.extend(after.iter().cloned());
-                buffer.set_text_with_cursor(combined.join("\n"), if text.is_empty() { line_start } else { line_start + text.len() - last_char_len(text) });
+                buffer.set_text_with_cursor(
+                    combined.join("\n"),
+                    if text.is_empty() {
+                        line_start
+                    } else {
+                        line_start + text.len() - last_char_len(text)
+                    },
+                );
             }
         }
         self.normalize_normal_cursor(buffer);
@@ -998,7 +1086,10 @@ fn text_object_scope_from_char(input: char) -> Option<TextObjectScope> {
 }
 
 fn is_supported_text_object(input: char) -> bool {
-    matches!(input, 'w' | 'W' | '"' | '\'' | '`' | '(' | ')' | 'b' | '[' | ']' | '{' | '}' | 'B' | '<' | '>')
+    matches!(
+        input,
+        'w' | 'W' | '"' | '\'' | '`' | '(' | ')' | 'b' | '[' | ']' | '{' | '}' | 'B' | '<' | '>'
+    )
 }
 
 fn apply_motion(text: &str, cursor: usize, motion: Motion, count: u32) -> usize {
@@ -1034,7 +1125,12 @@ fn operator_motion_range(
     op: Operator,
 ) -> Option<OperatorRange> {
     let target = apply_motion(text, cursor, motion, count);
-    if target == cursor && !matches!(motion, Motion::LineEnd | Motion::LineStart | Motion::FirstNonBlank) {
+    if target == cursor
+        && !matches!(
+            motion,
+            Motion::LineEnd | Motion::LineStart | Motion::FirstNonBlank
+        )
+    {
         return None;
     }
 
@@ -1045,7 +1141,10 @@ fn operator_motion_range(
     if op == Operator::Change && motion == Motion::WordForward {
         let word_end = change_word_end(text, cursor, count);
         end = word_end;
-    } else if matches!(motion, Motion::Up | Motion::Down | Motion::Top | Motion::Bottom) {
+    } else if matches!(
+        motion,
+        Motion::Up | Motion::Down | Motion::Top | Motion::Bottom
+    ) {
         linewise = true;
         start = line_start(text, start);
         end = line_end_exclusive(text, end);
@@ -1062,7 +1161,11 @@ fn operator_motion_range(
         return None;
     }
 
-    Some(OperatorRange { start, end, linewise })
+    Some(OperatorRange {
+        start,
+        end,
+        linewise,
+    })
 }
 
 fn change_word_end(text: &str, cursor: usize, count: u32) -> usize {
@@ -1092,7 +1195,12 @@ fn find_text_object(
     }
 }
 
-fn find_word_text_object(text: &str, cursor: usize, scope: TextObjectScope, big_word: bool) -> Option<(usize, usize)> {
+fn find_word_text_object(
+    text: &str,
+    cursor: usize,
+    scope: TextObjectScope,
+    big_word: bool,
+) -> Option<(usize, usize)> {
     if text.is_empty() {
         return None;
     }
@@ -1161,7 +1269,12 @@ fn find_word_text_object(text: &str, cursor: usize, scope: TextObjectScope, big_
     Some((start, end))
 }
 
-fn find_quote_text_object(text: &str, cursor: usize, quote: char, scope: TextObjectScope) -> Option<(usize, usize)> {
+fn find_quote_text_object(
+    text: &str,
+    cursor: usize,
+    quote: char,
+    scope: TextObjectScope,
+) -> Option<(usize, usize)> {
     let start = line_start(text, cursor);
     let end = line_end_exclusive(text, cursor);
     let line = &text[start..end];
@@ -1331,7 +1444,13 @@ fn first_non_blank(text: &str, cursor: usize) -> usize {
     let end = line_end_exclusive(text, cursor);
     let line = &text[start..end];
     line.char_indices()
-        .find_map(|(idx, ch)| if ch.is_whitespace() { None } else { Some(start + idx) })
+        .find_map(|(idx, ch)| {
+            if ch.is_whitespace() {
+                None
+            } else {
+                Some(start + idx)
+            }
+        })
         .unwrap_or(start)
 }
 
@@ -1364,7 +1483,10 @@ fn byte_index_for_char_col(text: &str, col: usize) -> usize {
     if col == 0 {
         return 0;
     }
-    text.char_indices().nth(col).map(|(idx, _)| idx).unwrap_or(text.len())
+    text.char_indices()
+        .nth(col)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len())
 }
 
 fn is_vim_word_char(ch: char) -> bool {
@@ -1387,7 +1509,9 @@ fn next_vim_word(text: &str, cursor: usize) -> usize {
 
     if is_vim_word_char(current) {
         while pos < text.len() {
-            let Some(ch) = char_at(text, pos) else { break; };
+            let Some(ch) = char_at(text, pos) else {
+                break;
+            };
             if !is_vim_word_char(ch) {
                 break;
             }
@@ -1395,7 +1519,9 @@ fn next_vim_word(text: &str, cursor: usize) -> usize {
         }
     } else if is_vim_punctuation(current) {
         while pos < text.len() {
-            let Some(ch) = char_at(text, pos) else { break; };
+            let Some(ch) = char_at(text, pos) else {
+                break;
+            };
             if !is_vim_punctuation(ch) {
                 break;
             }
@@ -1404,7 +1530,9 @@ fn next_vim_word(text: &str, cursor: usize) -> usize {
     }
 
     while pos < text.len() {
-        let Some(ch) = char_at(text, pos) else { break; };
+        let Some(ch) = char_at(text, pos) else {
+            break;
+        };
         if !ch.is_whitespace() {
             break;
         }
@@ -1419,7 +1547,9 @@ fn prev_vim_word(text: &str, cursor: usize) -> usize {
     }
     let mut pos = prev_char_boundary(text, cursor);
     while pos > 0 {
-        let Some(ch) = char_at(text, pos) else { break; };
+        let Some(ch) = char_at(text, pos) else {
+            break;
+        };
         if !ch.is_whitespace() {
             break;
         }
@@ -1432,7 +1562,9 @@ fn prev_vim_word(text: &str, cursor: usize) -> usize {
     if is_vim_word_char(ch) {
         while pos > 0 {
             let prev = prev_char_boundary(text, pos);
-            let Some(prev_ch) = char_at(text, prev) else { break; };
+            let Some(prev_ch) = char_at(text, prev) else {
+                break;
+            };
             if !is_vim_word_char(prev_ch) {
                 break;
             }
@@ -1441,7 +1573,9 @@ fn prev_vim_word(text: &str, cursor: usize) -> usize {
     } else if is_vim_punctuation(ch) {
         while pos > 0 {
             let prev = prev_char_boundary(text, pos);
-            let Some(prev_ch) = char_at(text, prev) else { break; };
+            let Some(prev_ch) = char_at(text, prev) else {
+                break;
+            };
             if !is_vim_punctuation(prev_ch) {
                 break;
             }
@@ -1457,7 +1591,9 @@ fn end_of_vim_word(text: &str, cursor: usize) -> usize {
     }
     let mut pos = next_char_boundary(text, cursor);
     while pos < text.len() {
-        let Some(ch) = char_at(text, pos) else { break; };
+        let Some(ch) = char_at(text, pos) else {
+            break;
+        };
         if !ch.is_whitespace() {
             break;
         }
@@ -1475,7 +1611,9 @@ fn end_of_vim_word(text: &str, cursor: usize) -> usize {
             if next >= text.len() {
                 break;
             }
-            let Some(next_ch) = char_at(text, next) else { break; };
+            let Some(next_ch) = char_at(text, next) else {
+                break;
+            };
             if !is_vim_word_char(next_ch) {
                 break;
             }
@@ -1487,7 +1625,9 @@ fn end_of_vim_word(text: &str, cursor: usize) -> usize {
             if next >= text.len() {
                 break;
             }
-            let Some(next_ch) = char_at(text, next) else { break; };
+            let Some(next_ch) = char_at(text, next) else {
+                break;
+            };
             if !is_vim_punctuation(next_ch) {
                 break;
             }
@@ -1516,7 +1656,10 @@ fn line_start_for_number(text: &str, line_number: u32) -> usize {
 }
 
 fn line_number_at(text: &str, cursor: usize) -> usize {
-    text[..cursor.min(text.len())].bytes().filter(|b| *b == b'\n').count()
+    text[..cursor.min(text.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
 }
 
 fn split_lines_preserve_empty(text: &str) -> Vec<String> {

@@ -113,7 +113,10 @@ mod tests {
         let cwd = temp_dir("task-list-empty");
         let mut ctx = ctx_for(cwd);
         let tool = TaskListTool::default();
-        let res = tool.call(serde_json::json!({}), &mut ctx).await.expect("call");
+        let res = tool
+            .call(serde_json::json!({}), &mut ctx)
+            .await
+            .expect("call");
         assert!(!res.is_error);
         assert_eq!(res.content.as_str().unwrap_or_default(), "No tasks found");
     }
@@ -136,7 +139,10 @@ mod tests {
             .expect("create");
 
         let tool = TaskListTool::default();
-        let res = tool.call(serde_json::json!({}), &mut ctx).await.expect("call");
+        let res = tool
+            .call(serde_json::json!({}), &mut ctx)
+            .await
+            .expect("call");
         assert!(!res.is_error);
         let out = res.content.as_str().unwrap_or_default();
         assert!(out.contains("List me"));

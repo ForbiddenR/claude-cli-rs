@@ -27,6 +27,16 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         usage: "/compact",
     },
     SlashCommandDef {
+        name: "resume",
+        description: "Pick and resume a previous session",
+        usage: "/resume [session-id]",
+    },
+    SlashCommandDef {
+        name: "search",
+        description: "Search the transcript and jump to a match",
+        usage: "/search [query]",
+    },
+    SlashCommandDef {
         name: "cost",
         description: "Show token/cost totals for this TUI run",
         usage: "/cost",

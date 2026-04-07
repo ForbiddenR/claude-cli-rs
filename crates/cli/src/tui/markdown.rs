@@ -161,7 +161,11 @@ impl MarkdownRenderer {
                         continue;
                     }
                     maybe_push_prefix(&mut cur, &mut pending_prefix);
-                    push_text(&mut cur, style_stack.last().copied().unwrap_or_default(), &text);
+                    push_text(
+                        &mut cur,
+                        style_stack.last().copied().unwrap_or_default(),
+                        &text,
+                    );
                 }
                 Event::Code(code) => {
                     maybe_push_prefix(&mut cur, &mut pending_prefix);
@@ -251,7 +255,9 @@ impl MarkdownRenderer {
 
 fn highlight_diff_block(code: &str) -> Vec<Line<'static>> {
     let header_style = Style::default().fg(Color::DarkGray);
-    let hunk_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let hunk_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let add_style = Style::default().fg(Color::Green);
     let del_style = Style::default().fg(Color::Red);
 
@@ -323,7 +329,12 @@ impl StreamingMarkdown {
         self.stable_lines.len() + self.tail_lines.len()
     }
 
-    pub fn into_static(mut self, full_text: &str, renderer: &MarkdownRenderer, width: usize) -> Vec<Line<'static>> {
+    pub fn into_static(
+        mut self,
+        full_text: &str,
+        renderer: &MarkdownRenderer,
+        width: usize,
+    ) -> Vec<Line<'static>> {
         self.update(full_text, renderer, width);
         let mut out = self.stable_lines;
         out.extend(self.tail_lines);
@@ -362,7 +373,12 @@ fn list_item_prefix(list_stack: &mut [ListState]) -> Span<'static> {
         format!("{indent}- ")
     };
 
-    Span::styled(prefix, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+    Span::styled(
+        prefix,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
 }
 
 fn heading_style(base: Option<Style>, level: u8) -> Style {
@@ -411,13 +427,14 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut cur_buf = String::new();
     let mut col: usize = 0;
 
-    let flush_segment = |spans: &mut Vec<Span<'static>>, style: &mut Option<Style>, buf: &mut String| {
-        if buf.is_empty() {
-            return;
-        }
-        let s = std::mem::take(buf);
-        spans.push(Span::styled(s, style.unwrap_or_default()));
-    };
+    let flush_segment =
+        |spans: &mut Vec<Span<'static>>, style: &mut Option<Style>, buf: &mut String| {
+            if buf.is_empty() {
+                return;
+            }
+            let s = std::mem::take(buf);
+            spans.push(Span::styled(s, style.unwrap_or_default()));
+        };
 
     let flush_wrapped_line = |out: &mut Vec<Line<'static>>,
                               spans: &mut Vec<Span<'static>>,

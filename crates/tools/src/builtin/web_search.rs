@@ -189,11 +189,7 @@ mod tests {
 
     #[test]
     fn domain_allowed_respects_allow_and_block_lists() {
-        assert!(domain_allowed(
-            "https://example.com/path",
-            &[],
-            &[]
-        ));
+        assert!(domain_allowed("https://example.com/path", &[], &[]));
 
         assert!(!domain_allowed(
             "https://example.com/path",
@@ -239,8 +235,17 @@ mod tests {
         collect_ddg_hits(&json, &mut hits);
 
         assert_eq!(hits.len(), 3);
-        assert!(hits.iter().any(|(t, u)| t == "A result" && u == "https://a.example/a"));
-        assert!(hits.iter().any(|(t, u)| t == "B result" && u == "https://b.example/b"));
-        assert!(hits.iter().any(|(t, u)| t == "C result" && u == "https://c.example/c"));
+        assert!(
+            hits.iter()
+                .any(|(t, u)| t == "A result" && u == "https://a.example/a")
+        );
+        assert!(
+            hits.iter()
+                .any(|(t, u)| t == "B result" && u == "https://b.example/b")
+        );
+        assert!(
+            hits.iter()
+                .any(|(t, u)| t == "C result" && u == "https://c.example/c")
+        );
     }
 }

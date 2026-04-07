@@ -132,7 +132,10 @@ mod tests {
         let cwd = temp_dir("task-output-missing");
         let mut ctx = ctx_for(cwd);
         let tool = TaskOutputTool::default();
-        let res = tool.call(serde_json::json!({}), &mut ctx).await.expect("call");
+        let res = tool
+            .call(serde_json::json!({}), &mut ctx)
+            .await
+            .expect("call");
         assert!(res.is_error);
     }
 

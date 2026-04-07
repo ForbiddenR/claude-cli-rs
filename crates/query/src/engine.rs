@@ -37,13 +37,7 @@ pub enum PermissionDecision {
 #[async_trait]
 pub trait QueryObserver: Send + Sync {
     /// Called immediately before a tool is executed (after permission is granted).
-    async fn on_tool_use_start(
-        &self,
-        _id: &str,
-        _name: &str,
-        _input: &serde_json::Value,
-    ) {
-    }
+    async fn on_tool_use_start(&self, _id: &str, _name: &str, _input: &serde_json::Value) {}
 
     /// Called after a tool completes (or is denied/invalid).
     async fn on_tool_use_result(
@@ -537,8 +531,7 @@ async fn execute_tool_call(
     let input_snapshot = input.clone();
 
     let Some(tool) = tools.get(&name) else {
-        let content =
-            serde_json::Value::String(format!("unknown tool: {name}"));
+        let content = serde_json::Value::String(format!("unknown tool: {name}"));
         if let Some(obs) = observer {
             obs.on_tool_use_result(&id, &name, &input, &content, true)
                 .await;
@@ -551,8 +544,7 @@ async fn execute_tool_call(
     };
 
     if let Err(err) = tool.validate_input(&input, ctx).await {
-        let content =
-            serde_json::Value::String(format!("invalid tool input: {err}"));
+        let content = serde_json::Value::String(format!("invalid tool input: {err}"));
         if let Some(obs) = observer {
             obs.on_tool_use_result(&id, &name, &input, &content, true)
                 .await;
@@ -634,8 +626,7 @@ async fn execute_tool_call(
         match checked {
             PermissionResult::Allow => {}
             PermissionResult::Deny { reason } => {
-                let content =
-                    serde_json::Value::String(format!("permission denied: {reason}"));
+                let content = serde_json::Value::String(format!("permission denied: {reason}"));
                 if let Some(obs) = observer {
                     obs.on_tool_use_result(&id, &name, &input_snapshot, &content, true)
                         .await;
@@ -664,7 +655,7 @@ async fn execute_tool_call(
                     &result.content,
                     result.is_error,
                 )
-                    .await;
+                .await;
             }
 
             ContentBlock::ToolResult {
@@ -691,7 +682,8 @@ async fn execute_tool_call(
 fn is_permission_mode_denial(reason: &str) -> bool {
     // Built-in tools use this phrasing for the "needs interactive approval" path in Default mode.
     // We only prompt the observer in this case, not for e.g. invalid inputs or path restrictions.
-    reason.contains("disabled in this permission mode") || reason.contains("Re-run with --permission-mode")
+    reason.contains("disabled in this permission mode")
+        || reason.contains("Re-run with --permission-mode")
 }
 
 fn persist_large_tool_result(

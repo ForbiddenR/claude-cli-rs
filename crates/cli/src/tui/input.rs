@@ -7,7 +7,7 @@ pub struct InputSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct InputBuffer {
     text: String,
-    cursor: usize,               // byte index, always a char boundary
+    cursor: usize,                   // byte index, always a char boundary
     selection_anchor: Option<usize>, // byte index, always a char boundary
 }
 
@@ -94,7 +94,11 @@ impl InputBuffer {
     pub fn delete_range(&mut self, start: usize, end: usize) {
         let start = clamp_to_char_boundary(&self.text, start.min(self.text.len()));
         let end = clamp_to_char_boundary(&self.text, end.min(self.text.len()));
-        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         if start == end {
             return;
         }
@@ -552,10 +556,7 @@ fn next_char_boundary(s: &str, idx: usize) -> usize {
 fn current_line_bounds(s: &str, cursor: usize) -> (usize, usize) {
     let cursor = cursor.min(s.len());
     let before = &s[..cursor];
-    let line_start = before
-        .rfind('\n')
-        .map(|i| i.saturating_add(1))
-        .unwrap_or(0);
+    let line_start = before.rfind('\n').map(|i| i.saturating_add(1)).unwrap_or(0);
 
     let after = &s[cursor..];
     let line_end = after
@@ -570,10 +571,7 @@ fn byte_index_for_char_col(s: &str, col: usize) -> usize {
     if col == 0 {
         return 0;
     }
-    s.char_indices()
-        .nth(col)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+    s.char_indices().nth(col).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 #[cfg(test)]

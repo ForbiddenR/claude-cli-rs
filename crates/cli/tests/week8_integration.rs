@@ -9,7 +9,9 @@ struct ExpectedRequest {
     sse_body: String,
 }
 
-fn spawn_mock_sse_server_sequence(responses: Vec<ExpectedRequest>) -> (SocketAddr, thread::JoinHandle<()>) {
+fn spawn_mock_sse_server_sequence(
+    responses: Vec<ExpectedRequest>,
+) -> (SocketAddr, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
     let addr = listener.local_addr().expect("server addr");
 
@@ -258,4 +260,3 @@ fn continue_session_includes_previous_messages() {
 
     handle2.join().expect("server thread");
 }
-

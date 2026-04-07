@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use claude_core::config::settings::EditorMode;
 use claude_core::types::ids::SessionId;
 use claude_core::types::message::{ContentBlock, Message, UserMessage};
@@ -17,12 +18,12 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
-use ratatui::Terminal;
 use similar::TextDiff;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,7 +38,7 @@ mod vim;
 use input::{InputBuffer, PromptHistory, ReverseHistorySearch};
 use keymap::{KeyAction, KeyContext, KeySequence, KeybindingResolver, ResolveOutcome};
 use markdown::{MarkdownRenderer, StreamingMarkdown};
-use slash::{match_commands, parse_slash_command, SlashCommandDef, SLASH_COMMANDS};
+use slash::{SLASH_COMMANDS, SlashCommandDef, match_commands, parse_slash_command};
 use vim::{VimHandleResult, VimKey, VimMachine, VimMode};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -74,6 +75,7 @@ struct App {
     reverse_history_search: Option<ReverseHistorySearch>,
     vim: Option<VimMachine>,
     keymap: KeybindingResolver,
+    dialog: Option<DialogState>,
     typeahead_query: Option<String>,
     typeahead_selected: usize,
     typeahead_suppressed_text: Option<String>,
@@ -124,6 +126,57 @@ struct App {
     last_turn_input_tokens: u64,
     last_turn_output_tokens: u64,
     last_turn_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+enum DialogState {
+    Onboarding(OnboardingDialog),
+    ModelPicker(ModelPickerDialog),
+    SessionResume(SessionResumeDialog),
+    TranscriptSearch(TranscriptSearchDialog),
+}
+
+#[derive(Debug, Clone)]
+struct OnboardingDialog;
+
+#[derive(Debug, Clone)]
+struct ModelPickerDialog {
+    filter: InputBuffer,
+    selected: usize,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionInfo {
+    id: SessionId,
+    path: PathBuf,
+    updated_at_ms: u64,
+    model: Option<String>,
+    cost_usd: Option<f64>,
+    response_preview: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionResumeDialog {
+    filter: InputBuffer,
+    selected: usize,
+    sessions: Vec<SessionInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct SearchHit {
+    entry_idx: usize,
+    role: Role,
+    preview: String,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptSearchDialog {
+    query: InputBuffer,
+    selected: usize,
+    hits: Vec<SearchHit>,
+    last_query: String,
+    last_transcript_len: usize,
 }
 
 #[derive(Clone)]
@@ -236,8 +289,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
         terminal::enable_raw_mode().context("enable raw mode")?;
-        execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
-            .context("enter alternate screen")?;
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        )
+        .context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -245,7 +302,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -403,7 +464,9 @@ impl App {
         if query_changed {
             self.typeahead_selected = 0;
         } else {
-            self.typeahead_selected = self.typeahead_selected.min(suggestions.len().saturating_sub(1));
+            self.typeahead_selected = self
+                .typeahead_selected
+                .min(suggestions.len().saturating_sub(1));
         }
         self.typeahead_query = Some(query);
     }
@@ -426,21 +489,30 @@ impl App {
             return;
         }
         let len = suggestions.len() as isize;
-        let cur = self.typeahead_selected.min(suggestions.len().saturating_sub(1)) as isize;
+        let cur = self
+            .typeahead_selected
+            .min(suggestions.len().saturating_sub(1)) as isize;
         let next = (cur + delta).rem_euclid(len) as usize;
         self.typeahead_selected = next;
     }
 
     fn accept_typeahead(&mut self) -> bool {
         let suggestions = self.typeahead_items();
-        let Some(selected) = suggestions.get(self.typeahead_selected.min(suggestions.len().saturating_sub(1))) else {
+        let Some(selected) = suggestions.get(
+            self.typeahead_selected
+                .min(suggestions.len().saturating_sub(1)),
+        ) else {
             return false;
         };
 
         let current = self.input.as_str().trim();
         let suffix = current
             .strip_prefix('/')
-            .map(|rest| rest.split_once(char::is_whitespace).map(|(_, tail)| tail).unwrap_or(""))
+            .map(|rest| {
+                rest.split_once(char::is_whitespace)
+                    .map(|(_, tail)| tail)
+                    .unwrap_or("")
+            })
             .unwrap_or("");
 
         let new_text = if suffix.trim().is_empty() {
@@ -514,6 +586,49 @@ impl App {
             (None, _) | (_, None) => None,
         };
     }
+
+    fn switch_to_session(
+        &mut self,
+        session_id: SessionId,
+        session_path: PathBuf,
+        history: Vec<Message>,
+        status: impl Into<String>,
+        note: impl Into<String>,
+    ) {
+        self.session_id = session_id;
+        self.session_path = session_path;
+        self.history = history;
+        self.prompt_history = PromptHistory::new(prompt_history_from_messages(&self.history));
+        self.prompt_history.reset_navigation();
+        self.reverse_history_search = None;
+        self.input.clear();
+        if let Some(vim) = self.vim.as_mut() {
+            vim.reset_insert_tracking();
+        }
+        self.permission_prompt = None;
+        self.active_assistant_idx = None;
+        self.tool_entry_for_id.clear();
+        self.dismiss_typeahead();
+        self.dialog = None;
+        self.in_flight = false;
+        self.transcript = transcript_from_history(&self.history);
+        if self.transcript.is_empty() {
+            self.transcript.push(ChatEntry {
+                role: Role::System,
+                text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
+            });
+        }
+        self.rendered = self
+            .transcript
+            .iter()
+            .map(|entry| RenderedEntry::new(entry.role))
+            .collect();
+        self.render_width = 0;
+        self.scroll_top = 0;
+        self.scroll_follow = true;
+        self.push_system_message(note);
+        self.status = status.into();
+    }
 }
 
 fn slash_query(input: &InputBuffer) -> Option<String> {
@@ -537,7 +652,12 @@ fn slash_query(input: &InputBuffer) -> Option<String> {
 fn slash_candidate_name(app: &App) -> Option<String> {
     let input = app.input.as_str().trim();
     let rest = input.strip_prefix('/')?;
-    let typed = rest.split_whitespace().next().unwrap_or_default().trim().to_ascii_lowercase();
+    let typed = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     if typed.is_empty() {
         return None;
     }
@@ -547,7 +667,10 @@ fn slash_candidate_name(app: &App) -> Option<String> {
 
     let suggestions = app.typeahead_items();
     suggestions
-        .get(app.typeahead_selected.min(suggestions.len().saturating_sub(1)))
+        .get(
+            app.typeahead_selected
+                .min(suggestions.len().saturating_sub(1)),
+        )
         .map(|cmd| cmd.name.to_string())
 }
 
@@ -555,15 +678,21 @@ fn slash_command_help() -> String {
     let mut out = String::new();
     out.push_str("Slash commands\n\n");
     for cmd in SLASH_COMMANDS {
-        out.push_str(&format!("- `{}`: {} ({})\n", cmd.name, cmd.description, cmd.usage));
+        out.push_str(&format!(
+            "- `{}`: {} ({})\n",
+            cmd.name, cmd.description, cmd.usage
+        ));
     }
     out.push_str("\nUseful shortcuts\n\n");
     out.push_str("- `Ctrl+L`: start a new empty session\n");
     out.push_str("- `Ctrl+X Ctrl+K`: compact the current chat\n");
+    out.push_str("- `Ctrl+F`: search transcript\n");
     out.push_str("- `Ctrl+X Ctrl+C`: exit\n");
     out.push_str("- `Tab`: accept the selected slash command\n");
     out.push_str("\nConfig\n\n");
-    out.push_str("- Override shortcuts via `tuiKeybindings` in settings JSON (user/project/local).\n");
+    out.push_str(
+        "- Override shortcuts via `tuiKeybindings` in settings JSON (user/project/local).\n",
+    );
     out
 }
 
@@ -571,11 +700,15 @@ fn role_header(role: Role) -> Line<'static> {
     let (label, style) = match role {
         Role::User => (
             "You",
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Role::Assistant => (
             "Claude",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Role::Tool => (
             "Tool",
@@ -585,9 +718,7 @@ fn role_header(role: Role) -> Line<'static> {
         ),
         Role::System => (
             "System",
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ),
     };
 
@@ -712,16 +843,10 @@ pub async fn run_tui(
     auth: AuthMode,
 ) -> anyhow::Result<()> {
     if !matches!(args.output_format, OutputFormat::Text) {
-        return Err(crate::UsageError(
-            "TUI mode requires --output-format text".to_string(),
-        )
-        .into());
+        return Err(crate::UsageError("TUI mode requires --output-format text".to_string()).into());
     }
     if !matches!(args.input_format, InputFormat::Text) {
-        return Err(crate::UsageError(
-            "TUI mode requires --input-format text".to_string(),
-        )
-        .into());
+        return Err(crate::UsageError("TUI mode requires --input-format text".to_string()).into());
     }
     if args.replay_user_messages {
         return Err(crate::UsageError(
@@ -766,6 +891,12 @@ pub async fn run_tui(
         &[KeyContext::Global],
         KeySequence::parse("ctrl+l")?,
         KeyAction::ClearChat,
+    );
+    // Week 9: transcript search.
+    keymap.add_binding(
+        &[KeyContext::Global],
+        KeySequence::parse("ctrl+f")?,
+        KeyAction::SearchTranscript,
     );
     // Week 8 deliverable: chord detection.
     keymap.add_binding(
@@ -827,7 +958,10 @@ pub async fn run_tui(
             ),
         });
     }
-    let rendered = transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
+    let rendered = transcript
+        .iter()
+        .map(|e| RenderedEntry::new(e.role))
+        .collect();
 
     let client = claude_services::api::AnthropicClient::new(None);
     let engine_inputs = compute_engine_inputs(args, settings)?;
@@ -838,6 +972,7 @@ pub async fn run_tui(
         engine_inputs.max_tokens,
         engine_inputs.cfg.clone(),
     )?);
+    let show_onboarding = !settings.tui_onboarding_seen.unwrap_or(false);
 
     let mut app = App {
         input: InputBuffer::new(),
@@ -845,6 +980,7 @@ pub async fn run_tui(
         reverse_history_search: None,
         vim,
         keymap,
+        dialog: show_onboarding.then_some(DialogState::Onboarding(OnboardingDialog)),
         typeahead_query: None,
         typeahead_selected: 0,
         typeahead_suppressed_text: None,
@@ -887,9 +1023,7 @@ pub async fn run_tui(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        terminal
-            .draw(|f| render(f, &mut app))
-            .context("render")?;
+        terminal.draw(|f| render(f, &mut app)).context("render")?;
 
         tokio::select! {
             maybe_ev = events.next() => {
@@ -918,7 +1052,7 @@ pub async fn run_tui(
 fn compute_engine_inputs(
     args: &Args,
     settings: &claude_core::config::settings::Settings,
- ) -> anyhow::Result<EngineInputs> {
+) -> anyhow::Result<EngineInputs> {
     let max_tokens = args.max_tokens.unwrap_or(1024);
     let max_turns = args.max_turns.unwrap_or(8);
 
@@ -1022,6 +1156,10 @@ async fn handle_term_event(
             if app.permission_prompt.is_some() {
                 return Ok(false);
             }
+            if let Some(dialog) = app.dialog.as_mut() {
+                dialog_paste(dialog, &text);
+                return Ok(false);
+            }
 
             if let Some(search) = app.reverse_history_search.as_mut() {
                 let mut q = text.replace('\n', " ");
@@ -1090,7 +1228,8 @@ async fn handle_term_event(
 
                             match saved {
                                 Ok(true) => {
-                                    app.status = format!("always allow {} (saved)", prompt.tool_name)
+                                    app.status =
+                                        format!("always allow {} (saved)", prompt.tool_name)
                                 }
                                 Ok(false) => {
                                     app.status =
@@ -1119,6 +1258,13 @@ async fn handle_term_event(
                             }
                         }
                     }
+                }
+                return Ok(false);
+            }
+
+            if app.dialog.is_some() {
+                if handle_dialog_key(app, key, query_tx.clone()).await? {
+                    return Ok(true);
                 }
                 return Ok(false);
             }
@@ -1442,6 +1588,23 @@ async fn handle_key_action(
         KeyAction::ShowCost => {
             return execute_slash_command(app, "cost", &[], query_tx).await;
         }
+        KeyAction::ShowModelPicker => {
+            if app.in_flight {
+                app.status = "busy; wait for the current run to finish".to_string();
+            } else {
+                open_model_picker(app)?;
+            }
+        }
+        KeyAction::ResumeSession => {
+            if app.in_flight {
+                app.status = "busy; wait for the current run to finish".to_string();
+            } else {
+                open_session_resume(app)?;
+            }
+        }
+        KeyAction::SearchTranscript => {
+            open_transcript_search(app, None);
+        }
         KeyAction::TypeaheadNext => {
             app.move_typeahead(1);
             app.status = "slash command".to_string();
@@ -1481,8 +1644,7 @@ async fn execute_slash_command(
         }
         "model" => {
             if args.is_empty() {
-                app.push_system_message(format!("Current model: `{}`", app.model));
-                app.status = format!("model {}", app.model);
+                open_model_picker(app)?;
             } else {
                 let next = args.join(" ").trim().to_string();
                 if next.is_empty() {
@@ -1496,6 +1658,46 @@ async fn execute_slash_command(
                     app.status = format!("model {}", app.model);
                 }
             }
+        }
+        "resume" => {
+            if app.in_flight {
+                app.status = "cannot resume while a run is active".to_string();
+            } else if args.is_empty() {
+                if let Err(err) = open_session_resume(app) {
+                    app.status = "resume failed".to_string();
+                    app.push_system_message(format!("error: failed to open session resume: {err}"));
+                }
+            } else {
+                let joined = args.join(" ");
+                let raw = joined.trim();
+                if raw.is_empty() {
+                    if let Err(err) = open_session_resume(app) {
+                        app.status = "resume failed".to_string();
+                        app.push_system_message(format!(
+                            "error: failed to open session resume: {err}"
+                        ));
+                    }
+                } else {
+                    match raw.parse::<SessionId>() {
+                        Ok(id) => {
+                            if let Err(err) = resume_session_by_id(app, id) {
+                                app.status = "resume failed".to_string();
+                                app.push_system_message(format!(
+                                    "error: failed to resume session {id}: {err}"
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            app.status = "resume usage".to_string();
+                            app.push_system_message("usage: /resume [session-id]");
+                        }
+                    }
+                }
+            }
+        }
+        "search" => {
+            let query = args.join(" ");
+            open_transcript_search(app, (!query.trim().is_empty()).then_some(query));
         }
         "clear" => {
             if app.in_flight {
@@ -1522,16 +1724,21 @@ async fn execute_slash_command(
                     match engine.compact_history_now(history).await {
                         Ok(compacted) => {
                             let session_id = SessionId::new();
-                            let session_path = match claude_core::history::session_file_path(&cwd, session_id) {
-                                Ok(path) => path,
-                                Err(err) => {
-                                    let _ = query_tx.send(QueryEvent::CompactionError(err.to_string()));
-                                    return;
-                                }
-                            };
+                            let session_path =
+                                match claude_core::history::session_file_path(&cwd, session_id) {
+                                    Ok(path) => path,
+                                    Err(err) => {
+                                        let _ = query_tx
+                                            .send(QueryEvent::CompactionError(err.to_string()));
+                                        return;
+                                    }
+                                };
 
                             // Best-effort persistence so `--continue/--resume` sees the compacted context.
-                            let _ = claude_core::history::append_session_messages(&session_path, &compacted);
+                            let _ = claude_core::history::append_session_messages(
+                                &session_path,
+                                &compacted,
+                            );
 
                             let _ = query_tx.send(QueryEvent::CompactionFinished {
                                 session_id,
@@ -1572,8 +1779,14 @@ async fn execute_slash_command(
         }
         "exit" => return Ok(true),
         other => {
-            let known = SLASH_COMMANDS.iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
-            app.push_system_message(format!("Unknown slash command `{other}`. Available: {known}"));
+            let known = SLASH_COMMANDS
+                .iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            app.push_system_message(format!(
+                "Unknown slash command `{other}`. Available: {known}"
+            ));
             app.status = format!("unknown command `{other}`");
         }
     }
@@ -1581,10 +1794,7 @@ async fn execute_slash_command(
     Ok(false)
 }
 
-fn submit_prompt(
-    app: &mut App,
-    query_tx: mpsc::UnboundedSender<QueryEvent>,
-) -> anyhow::Result<()> {
+fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> anyhow::Result<()> {
     if app.in_flight {
         return Ok(());
     }
@@ -1636,21 +1846,31 @@ fn submit_prompt(
     tokio::spawn(async move {
         let tx_for_deltas = query_tx.clone();
         let observer: std::sync::Arc<dyn claude_query::QueryObserver> =
-            std::sync::Arc::new(TuiObserver { tx: query_tx.clone(), always_allow_tools });
+            std::sync::Arc::new(TuiObserver {
+                tx: query_tx.clone(),
+                always_allow_tools,
+            });
 
         let res = engine
-            .run_with_history_observed(history_for_engine, |event| {
-                if let Some(text) = crate::extract_text_delta(event) {
-                    let _ = tx_for_deltas.send(QueryEvent::TextDelta(text.to_string()));
-                }
-                Ok(())
-            }, observer)
+            .run_with_history_observed(
+                history_for_engine,
+                |event| {
+                    if let Some(text) = crate::extract_text_delta(event) {
+                        let _ = tx_for_deltas.send(QueryEvent::TextDelta(text.to_string()));
+                    }
+                    Ok(())
+                },
+                observer,
+            )
             .await;
 
         match res {
             Ok(result) => {
                 if !result.new_messages.is_empty() {
-                    let _ = claude_core::history::append_session_messages(&session_path, &result.new_messages);
+                    let _ = claude_core::history::append_session_messages(
+                        &session_path,
+                        &result.new_messages,
+                    );
                 }
                 write_session_meta_silent(session_id, &session_path, &result);
                 let _ = query_tx.send(QueryEvent::Finished(result));
@@ -1674,7 +1894,8 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                         role: Role::Assistant,
                         text: String::new(),
                     });
-                    app.rendered.push(RenderedEntry::new_streaming(Role::Assistant));
+                    app.rendered
+                        .push(RenderedEntry::new_streaming(Role::Assistant));
                     let idx = app.transcript.len().saturating_sub(1);
                     app.active_assistant_idx = Some(idx);
                     idx
@@ -1697,6 +1918,9 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             if let Some(idx) = app.active_assistant_idx.take() {
                 app.finalize_streaming(idx);
             }
+            // Permission prompts take over input focus.
+            app.dialog = None;
+            app.keymap.clear_pending();
             let activity = tool_activity_status(&name, &input);
             let details = permission_details(&app.cwd, &name, &input);
             app.permission_prompt = Some(PermissionPrompt {
@@ -1773,29 +1997,13 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             session_path,
             history,
         } => {
-            app.in_flight = false;
-            app.active_assistant_idx = None;
-            app.permission_prompt = None;
-            app.tool_entry_for_id.clear();
-
-            app.session_id = session_id;
-            app.session_path = session_path;
-            app.history = history;
-
-            app.transcript = transcript_from_history(&app.history);
-            if app.transcript.is_empty() {
-                app.transcript.push(ChatEntry {
-                    role: Role::System,
-                    text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
-                });
-            }
-            app.rendered = app.transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
-            app.render_width = 0;
-            app.scroll_top = 0;
-            app.scroll_follow = true;
-
-            app.push_system_message(format!("Compaction complete • new session {}", app.session_id));
-            app.status = "compaction done".to_string();
+            app.switch_to_session(
+                session_id,
+                session_path,
+                history,
+                "compaction done",
+                format!("Compaction complete • new session {}", session_id),
+            );
         }
         QueryEvent::CompactionError(err) => {
             app.in_flight = false;
@@ -1965,7 +2173,9 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     if let Some(search) = &app.reverse_history_search {
         let query = search.query();
         let preview = crate::one_line_preview(app.input.as_str(), 80);
-        let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
+        let vim_prefix = vim_label
+            .map(|mode| format!("{mode} • "))
+            .unwrap_or_default();
         let body = format!(
             "{spin} {vim_prefix}reverse-i-search `{query}`: {preview} • Enter accept • Esc cancel • Ctrl+R older"
         );
@@ -1973,7 +2183,9 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     }
 
     if let Some(query) = app.typeahead_query.as_deref() {
-        let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
+        let vim_prefix = vim_label
+            .map(|mode| format!("{mode} • "))
+            .unwrap_or_default();
         let body = format!(
             "{spin} {vim_prefix}slash command `/{query}` • Up/Down select • Tab complete • Enter run • Esc clear"
         );
@@ -1994,13 +2206,25 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     } else {
         " • Alt+Enter newline • Up/Down history • Ctrl+R search"
     };
-    let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
+    let vim_prefix = vim_label
+        .map(|mode| format!("{mode} • "))
+        .unwrap_or_default();
 
-    Line::from(format!("{spin} {vim_prefix}{}{scroll_hint}{input_hint}", app.status)).style(style)
+    Line::from(format!(
+        "{spin} {vim_prefix}{}{scroll_hint}{input_hint}",
+        app.status
+    ))
+    .style(style)
 }
 
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     app.sync_typeahead();
+    if let Some(DialogState::TranscriptSearch(dialog)) = app.dialog.as_mut() {
+        let q = dialog.query.as_str().trim().to_ascii_lowercase();
+        if q != dialog.last_query || dialog.last_transcript_len != app.transcript.len() {
+            recompute_search_hits(dialog, &app.transcript);
+        }
+    }
     let size = f.size();
     let max_input_lines = size.height.saturating_sub(5).max(1) as usize;
     let max_input_lines = max_input_lines.min(MAX_INPUT_VISIBLE_LINES);
@@ -2040,7 +2264,12 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         "claude-rs • session {} • model {} • Ctrl+C to exit",
         app.session_id, app.model
     ))
-    .style(Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_widget(Paragraph::new(header), chunks[0]);
 
     // Messages
@@ -2082,7 +2311,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let (input_area, typeahead_area) = if typeahead_area_height >= 2 {
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(typeahead_area_height)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(typeahead_area_height),
+            ])
             .split(input_inner);
         (split[0], split[1])
     } else {
@@ -2109,9 +2341,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         f.render_widget(ratatui::widgets::Clear, typeahead_area);
 
         // A top border line to visually separate suggestions from input text.
-        let list_block = Block::default()
-            .borders(Borders::TOP)
-            .title("Commands");
+        let list_block = Block::default().borders(Borders::TOP).title("Commands");
         let list_inner = list_block.inner(typeahead_area);
         f.render_widget(&list_block, typeahead_area);
 
@@ -2146,7 +2376,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let cursor_x = input_area.x + input_layout.cursor_col as u16;
     let cursor_y = input_area.y + input_layout.cursor_row as u16;
-    if app.permission_prompt.is_none() {
+    if app.permission_prompt.is_none() && app.dialog.is_none() {
         f.set_cursor(cursor_x, cursor_y);
     }
 
@@ -2166,8 +2396,17 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Some(prompt) = &app.permission_prompt {
         render_permission_modal(f, prompt, size);
     }
+
+    // Week 9: dialog overlays.
+    if let Some(dialog) = &app.dialog {
+        render_dialog_modal(f, app, dialog, size);
+    }
 }
-fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
     let percent_x = percent_x.min(100).max(1);
     let percent_y = percent_y.min(100).max(1);
 
@@ -2223,6 +2462,798 @@ fn format_permission_prompt_text(prompt: &PermissionPrompt) -> String {
     out
 }
 
+fn list_window_start(selected: usize, len: usize, height: usize) -> usize {
+    if height == 0 || len <= height {
+        return 0;
+    }
+    let half = height / 2;
+    selected
+        .saturating_sub(half)
+        .min(len.saturating_sub(height))
+}
+
+fn available_models(current: &str) -> Vec<String> {
+    let mut models = vec![
+        "claude-sonnet-4-6".to_string(),
+        "claude-opus-4-6".to_string(),
+        "claude-opus-4-1-20250805".to_string(),
+        "claude-3-5-haiku-20241022".to_string(),
+        "claude-haiku-4-5-20251001".to_string(),
+    ];
+    if !models.iter().any(|model| model == current) {
+        models.insert(0, current.to_string());
+    }
+    models
+}
+
+fn open_model_picker(app: &mut App) -> anyhow::Result<()> {
+    let mut models = available_models(&app.model);
+    if let Ok(sessions) = list_recent_sessions(&app.cwd) {
+        for s in sessions {
+            if let Some(model) = s.model {
+                if !models.iter().any(|m| m == &model) {
+                    models.push(model);
+                }
+            }
+        }
+    }
+    models.sort();
+    models.dedup();
+
+    let selected = models
+        .iter()
+        .position(|model| model == &app.model)
+        .unwrap_or(0);
+
+    app.keymap.clear_pending();
+    app.dismiss_typeahead();
+    app.reverse_history_search = None;
+    app.dialog = Some(DialogState::ModelPicker(ModelPickerDialog {
+        filter: InputBuffer::new(),
+        selected,
+        models,
+    }));
+    app.status = "model picker".to_string();
+    Ok(())
+}
+
+fn filtered_models(dialog: &ModelPickerDialog) -> Vec<String> {
+    let q = dialog.filter.as_str().trim().to_ascii_lowercase();
+    let mut out: Vec<String> = dialog
+        .models
+        .iter()
+        .filter(|model| q.is_empty() || model.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect();
+    if out.is_empty() && !q.is_empty() {
+        out.push(dialog.filter.as_str().trim().to_string());
+    }
+    out
+}
+
+fn open_session_resume(app: &mut App) -> anyhow::Result<()> {
+    let sessions = list_recent_sessions(&app.cwd)?;
+    if sessions.is_empty() {
+        app.push_system_message("No previous sessions found for this project yet.");
+        app.status = "resume unavailable".to_string();
+        return Ok(());
+    }
+
+    let selected = sessions
+        .iter()
+        .position(|session| session.id == app.session_id)
+        .unwrap_or(0);
+    app.keymap.clear_pending();
+    app.dismiss_typeahead();
+    app.reverse_history_search = None;
+    app.dialog = Some(DialogState::SessionResume(SessionResumeDialog {
+        filter: InputBuffer::new(),
+        selected,
+        sessions,
+    }));
+    app.status = "resume session".to_string();
+    Ok(())
+}
+
+fn list_recent_sessions(cwd: &Path) -> anyhow::Result<Vec<SessionInfo>> {
+    let dir = claude_core::history::project_dir_for_cwd(cwd)?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut sessions = Vec::new();
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => continue,
+        };
+        let path = ent.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(id) = stem.parse::<SessionId>() else {
+            continue;
+        };
+
+        let mut updated_at_ms = ent
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|dur| dur.as_millis() as u64)
+            .unwrap_or(0);
+        let mut model = None;
+        let mut cost_usd = None;
+        let mut response_preview = None;
+
+        let meta_path = path.with_extension("meta.json");
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(v) = meta.get("updated_at_ms").and_then(|v| v.as_u64()) {
+                    updated_at_ms = v;
+                }
+                model = meta
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                cost_usd = meta.get("cost_usd").and_then(|v| v.as_f64());
+                response_preview = meta
+                    .get("response_preview")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+
+        sessions.push(SessionInfo {
+            id,
+            path,
+            updated_at_ms,
+            model,
+            cost_usd,
+            response_preview,
+        });
+    }
+
+    sessions.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+    });
+    Ok(sessions)
+}
+
+fn filtered_sessions(dialog: &SessionResumeDialog) -> Vec<SessionInfo> {
+    let q = dialog.filter.as_str().trim().to_ascii_lowercase();
+    dialog
+        .sessions
+        .iter()
+        .filter(|session| {
+            q.is_empty()
+                || session.id.to_string().contains(&q)
+                || session
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model.to_ascii_lowercase().contains(&q))
+                || session
+                    .response_preview
+                    .as_deref()
+                    .is_some_and(|preview| preview.to_ascii_lowercase().contains(&q))
+        })
+        .cloned()
+        .collect()
+}
+
+fn resume_session_by_id(app: &mut App, session_id: SessionId) -> anyhow::Result<()> {
+    let session_path = claude_core::history::session_file_path(&app.cwd, session_id)?;
+    let history = claude_core::history::load_session_messages(&session_path)?;
+    app.switch_to_session(
+        session_id,
+        session_path,
+        history,
+        format!("resumed {}", session_id),
+        format!("Resumed session `{session_id}`."),
+    );
+    Ok(())
+}
+
+fn open_transcript_search(app: &mut App, initial_query: Option<String>) {
+    app.keymap.clear_pending();
+    app.dismiss_typeahead();
+    app.reverse_history_search = None;
+
+    let mut dialog = TranscriptSearchDialog {
+        query: InputBuffer::new(),
+        selected: 0,
+        hits: Vec::new(),
+        last_query: String::new(),
+        last_transcript_len: 0,
+    };
+    if let Some(query) = initial_query {
+        dialog.query.set_text(query);
+    }
+    recompute_search_hits(&mut dialog, &app.transcript);
+    app.dialog = Some(DialogState::TranscriptSearch(dialog));
+    app.status = "search transcript".to_string();
+}
+
+fn recompute_search_hits(dialog: &mut TranscriptSearchDialog, transcript: &[ChatEntry]) {
+    let query = dialog.query.as_str().trim().to_ascii_lowercase();
+    dialog.last_query = query.clone();
+    dialog.last_transcript_len = transcript.len();
+    dialog.hits.clear();
+
+    if query.is_empty() {
+        dialog.selected = 0;
+        return;
+    }
+
+    for (entry_idx, entry) in transcript.iter().enumerate() {
+        let haystack = entry.text.to_ascii_lowercase();
+        if !haystack.contains(&query) {
+            continue;
+        }
+
+        let preview = search_preview(&entry.text, &query);
+        dialog.hits.push(SearchHit {
+            entry_idx,
+            role: entry.role,
+            preview,
+        });
+    }
+
+    if dialog.hits.is_empty() {
+        dialog.selected = 0;
+    } else {
+        dialog.selected = dialog.selected.min(dialog.hits.len().saturating_sub(1));
+    }
+}
+
+fn search_preview(text: &str, query: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let start = lower
+        .find(query)
+        .and_then(|idx| {
+            let prefix = text[..idx].chars().count();
+            prefix.checked_sub(30)
+        })
+        .unwrap_or(0);
+    let snippet = text.chars().skip(start).take(120).collect::<String>();
+    crate::one_line_preview(&snippet, 120)
+}
+
+fn jump_to_entry(app: &mut App, entry_idx: usize) {
+    let line = app
+        .line_offsets
+        .get(entry_idx)
+        .copied()
+        .unwrap_or_else(|| entry_idx.saturating_mul(3));
+    app.scroll_top = line;
+    app.scroll_follow = false;
+    app.status = format!("jumped to match {}", entry_idx.saturating_add(1));
+}
+
+fn dialog_paste(dialog: &mut DialogState, text: &str) {
+    let text = text.replace('\n', " ").replace('\r', " ");
+    match dialog {
+        DialogState::Onboarding(_) => {}
+        DialogState::ModelPicker(model) => {
+            model.filter.insert_str(text.trim_end());
+            let len = filtered_models(model).len();
+            model.selected = model.selected.min(len.saturating_sub(1));
+        }
+        DialogState::SessionResume(resume) => {
+            resume.filter.insert_str(text.trim_end());
+            let len = filtered_sessions(resume).len();
+            resume.selected = resume.selected.min(len.saturating_sub(1));
+        }
+        DialogState::TranscriptSearch(search) => {
+            search.query.insert_str(text.trim_end());
+        }
+    }
+}
+
+async fn handle_dialog_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    _query_tx: mpsc::UnboundedSender<QueryEvent>,
+) -> anyhow::Result<bool> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    let Some(mut state) = app.dialog.take() else {
+        return Ok(false);
+    };
+
+    let mut keep_dialog = true;
+    let mut should_quit = false;
+
+    match &mut state {
+        DialogState::Onboarding(_) => match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                persist_tui_onboarding_seen(&app.user_settings_path)?;
+                app.status = "ready".to_string();
+                keep_dialog = false;
+            }
+            KeyCode::Esc
+            | KeyCode::Char('q')
+            | KeyCode::Char('Q')
+            | KeyCode::Char('n')
+            | KeyCode::Char('N') => {
+                should_quit = true;
+                keep_dialog = false;
+            }
+            _ => {}
+        },
+        DialogState::ModelPicker(dialog) => {
+            let items = filtered_models(dialog);
+            let len = items.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.status = "ready".to_string();
+                    keep_dialog = false;
+                }
+                KeyCode::Up => {
+                    if len > 0 {
+                        dialog.selected = dialog.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if len > 0 {
+                        dialog.selected = (dialog.selected + 1).min(len.saturating_sub(1));
+                    }
+                }
+                KeyCode::Backspace => {
+                    dialog.filter.backspace();
+                    let len = filtered_models(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Delete => {
+                    dialog.filter.delete_forward();
+                    let len = filtered_models(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Left => dialog.filter.move_left(false),
+                KeyCode::Right => dialog.filter.move_right(false),
+                KeyCode::Home => dialog.filter.move_to_start(false),
+                KeyCode::End => dialog.filter.move_to_end(false),
+                KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
+                    dialog.filter.move_to_start(false)
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if ctrl => dialog.filter.move_to_end(false),
+                KeyCode::Char(ch) if !ctrl && !alt => {
+                    dialog.filter.insert_char(ch);
+                    let len = filtered_models(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let picked = filtered_models(dialog)
+                        .get(dialog.selected)
+                        .cloned()
+                        .or_else(|| {
+                            let raw = dialog.filter.as_str().trim();
+                            (!raw.is_empty()).then(|| raw.to_string())
+                        });
+                    if let Some(next_model) = picked {
+                        if app.in_flight {
+                            app.status = "cannot change model while a run is active".to_string();
+                        } else if next_model.trim().is_empty() {
+                            // no-op
+                        } else {
+                            app.model = next_model.clone();
+                            app.rebuild_engine()?;
+                            app.status = format!("model {}", app.model);
+                            app.push_system_message(format!("Model updated to `{next_model}`"));
+                            keep_dialog = false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        DialogState::SessionResume(dialog) => {
+            let items = filtered_sessions(dialog);
+            let len = items.len();
+            match key.code {
+                KeyCode::Esc => {
+                    app.status = "ready".to_string();
+                    keep_dialog = false;
+                }
+                KeyCode::Up => {
+                    if len > 0 {
+                        dialog.selected = dialog.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if len > 0 {
+                        dialog.selected = (dialog.selected + 1).min(len.saturating_sub(1));
+                    }
+                }
+                KeyCode::Backspace => {
+                    dialog.filter.backspace();
+                    let len = filtered_sessions(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Delete => {
+                    dialog.filter.delete_forward();
+                    let len = filtered_sessions(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Left => dialog.filter.move_left(false),
+                KeyCode::Right => dialog.filter.move_right(false),
+                KeyCode::Home => dialog.filter.move_to_start(false),
+                KeyCode::End => dialog.filter.move_to_end(false),
+                KeyCode::Char('a') | KeyCode::Char('A') if ctrl => {
+                    dialog.filter.move_to_start(false)
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if ctrl => dialog.filter.move_to_end(false),
+                KeyCode::Char(ch) if !ctrl && !alt => {
+                    dialog.filter.insert_char(ch);
+                    let len = filtered_sessions(dialog).len();
+                    dialog.selected = dialog.selected.min(len.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let id = filtered_sessions(dialog)
+                        .get(dialog.selected)
+                        .map(|session| session.id)
+                        .or_else(|| dialog.filter.as_str().trim().parse::<SessionId>().ok());
+                    if let Some(id) = id {
+                        resume_session_by_id(app, id)?;
+                        keep_dialog = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        DialogState::TranscriptSearch(dialog) => match key.code {
+            KeyCode::Esc => {
+                app.status = "ready".to_string();
+                keep_dialog = false;
+            }
+            KeyCode::Up => {
+                if !dialog.hits.is_empty() {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if !dialog.hits.is_empty() {
+                    dialog.selected =
+                        (dialog.selected + 1).min(dialog.hits.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Backspace => {
+                dialog.query.backspace();
+                recompute_search_hits(dialog, &app.transcript);
+            }
+            KeyCode::Delete => {
+                dialog.query.delete_forward();
+                recompute_search_hits(dialog, &app.transcript);
+            }
+            KeyCode::Left => dialog.query.move_left(false),
+            KeyCode::Right => dialog.query.move_right(false),
+            KeyCode::Home => dialog.query.move_to_start(false),
+            KeyCode::End => dialog.query.move_to_end(false),
+            KeyCode::Char('a') | KeyCode::Char('A') if ctrl => dialog.query.move_to_start(false),
+            KeyCode::Char('e') | KeyCode::Char('E') if ctrl => dialog.query.move_to_end(false),
+            KeyCode::Char(ch) if !ctrl && !alt => {
+                dialog.query.insert_char(ch);
+                recompute_search_hits(dialog, &app.transcript);
+            }
+            KeyCode::Enter => {
+                if let Some(hit) = dialog.hits.get(dialog.selected) {
+                    let entry_idx = hit.entry_idx;
+                    jump_to_entry(app, entry_idx);
+                    keep_dialog = false;
+                }
+            }
+            _ => {}
+        },
+    }
+
+    if keep_dialog {
+        app.dialog = Some(state);
+    }
+
+    Ok(should_quit)
+}
+
+fn persist_tui_onboarding_seen(settings_path: &Path) -> anyhow::Result<()> {
+    let _lock = crate::lock_settings_path(settings_path)?;
+    let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
+    let Some(obj) = root.as_object_mut() else {
+        anyhow::bail!(
+            "settings root must be a JSON object: {}",
+            settings_path.display()
+        );
+    };
+    obj.insert(
+        "tuiOnboardingSeen".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    crate::save_settings_json(settings_path, &root)?;
+    Ok(())
+}
+
+fn render_dialog_modal(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    dialog: &DialogState,
+    area: ratatui::layout::Rect,
+) {
+    match dialog {
+        DialogState::Onboarding(_) => render_onboarding_dialog(f, app, area),
+        DialogState::ModelPicker(dialog) => render_model_picker_dialog(f, app, dialog, area),
+        DialogState::SessionResume(dialog) => render_session_resume_dialog(f, app, dialog, area),
+        DialogState::TranscriptSearch(dialog) => render_transcript_search_dialog(f, dialog, area),
+    }
+}
+
+fn render_onboarding_dialog(f: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    let popup = centered_rect(72, 52, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let body = format!(
+        "Welcome to the Claude Rust TUI.\n\n\
+Project: {}\n\
+Model: {}\n\n\
+This terminal UI can stream responses, run tools, and resume prior sessions.\n\
+Tool calls still follow your current permission mode: {:?}.\n\n\
+Useful keys\n\
+- Enter submits the prompt\n\
+- Alt+Enter inserts a newline\n\
+- Ctrl+F opens transcript search\n\
+- /model opens the model picker\n\
+- /resume opens recent sessions\n\n\
+Press Enter to continue and save this onboarding step.\n\
+Press Esc to quit.",
+        app.cwd.display(),
+        app.model,
+        app.engine_inputs.cfg.permission_mode
+    );
+
+    let widget =
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("Welcome"));
+    f.render_widget(widget, popup);
+}
+
+fn render_model_picker_dialog(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    dialog: &ModelPickerDialog,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(70, 60, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title("Model Picker");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let filter = Paragraph::new(format!("Filter: {}", dialog.filter.as_str()));
+    f.render_widget(filter, rows[0]);
+
+    let items = filtered_models(dialog);
+    let visible_h = rows[1].height as usize;
+    let start = list_window_start(dialog.selected, items.len(), visible_h);
+    let items = items
+        .into_iter()
+        .skip(start)
+        .take(visible_h)
+        .enumerate()
+        .map(|(offset, model)| {
+            let idx = start.saturating_add(offset);
+            let mut spans = vec![Span::styled(
+                model.clone(),
+                Style::default().fg(if model == app.model {
+                    Color::Green
+                } else {
+                    Color::White
+                }),
+            )];
+            if let Some(costs) = claude_query::cost::model_costs(&model) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!(
+                        "(${:.2}/${:.2} per Mtok)",
+                        costs.input_per_mtok, costs.output_per_mtok
+                    ),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            let mut item = ListItem::new(Line::from(spans));
+            if idx == dialog.selected {
+                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+
+    f.render_widget(List::new(items), rows[1]);
+    f.render_widget(
+        Paragraph::new("Up/Down select • Enter apply • type to filter • Esc close"),
+        rows[2],
+    );
+    let cursor_x = rows[0]
+        .x
+        .saturating_add("Filter: ".len() as u16)
+        .saturating_add(dialog.filter.cursor() as u16);
+    f.set_cursor(cursor_x, rows[0].y);
+}
+
+fn render_session_resume_dialog(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    dialog: &SessionResumeDialog,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(80, 65, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Resume Session");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(format!("Filter: {}", dialog.filter.as_str())),
+        rows[0],
+    );
+
+    let sessions = filtered_sessions(dialog);
+    let visible_h = rows[1].height as usize;
+    let start = list_window_start(dialog.selected, sessions.len(), visible_h);
+    let items = sessions
+        .into_iter()
+        .skip(start)
+        .take(visible_h)
+        .enumerate()
+        .map(|(offset, session)| {
+            let idx = start.saturating_add(offset);
+            let mut line = format!(
+                "{}  {}",
+                format_updated_at_ms(session.updated_at_ms),
+                session.id
+            );
+            if let Some(model) = &session.model {
+                line.push_str(&format!("  {model}"));
+            }
+            if let Some(cost) = session.cost_usd {
+                line.push_str(&format!("  ${cost:.4}"));
+            }
+            if session.id == app.session_id {
+                line.push_str("  (current)");
+            }
+            let preview = session
+                .response_preview
+                .as_deref()
+                .map(|s| crate::one_line_preview(s, 100))
+                .unwrap_or_else(|| session.path.display().to_string());
+            let mut item = ListItem::new(Line::from(format!("{line}  —  {preview}")));
+            if idx == dialog.selected {
+                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(List::new(items), rows[1]);
+    f.render_widget(
+        Paragraph::new(
+            "Up/Down select • Enter resume • type to filter by id/model/preview • Esc close",
+        ),
+        rows[2],
+    );
+    let cursor_x = rows[0]
+        .x
+        .saturating_add("Filter: ".len() as u16)
+        .saturating_add(dialog.filter.cursor() as u16);
+    f.set_cursor(cursor_x, rows[0].y);
+}
+
+fn render_transcript_search_dialog(
+    f: &mut ratatui::Frame<'_>,
+    dialog: &TranscriptSearchDialog,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(78, 60, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Transcript Search");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(format!("Query: {}", dialog.query.as_str())),
+        rows[0],
+    );
+
+    let visible_h = rows[1].height as usize;
+    let start = list_window_start(dialog.selected, dialog.hits.len(), visible_h);
+    let items = dialog
+        .hits
+        .iter()
+        .skip(start)
+        .take(visible_h)
+        .enumerate()
+        .map(|(offset, hit)| {
+            let idx = start.saturating_add(offset);
+            let role = match hit.role {
+                Role::User => "You",
+                Role::Assistant => "Claude",
+                Role::Tool => "Tool",
+                Role::System => "System",
+            };
+            let mut item = ListItem::new(Line::from(format!(
+                "{role} #{:03}  {}",
+                hit.entry_idx.saturating_add(1),
+                hit.preview
+            )));
+            if idx == dialog.selected {
+                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(List::new(items), rows[1]);
+
+    let footer = if dialog.query.as_str().trim().is_empty() {
+        "Type to search the current transcript • Esc close"
+    } else if dialog.hits.is_empty() {
+        "No matches • Enter does nothing • Esc close"
+    } else {
+        "Up/Down select • Enter jump • Esc close"
+    };
+    f.render_widget(Paragraph::new(footer), rows[2]);
+    let cursor_x = rows[0]
+        .x
+        .saturating_add("Query: ".len() as u16)
+        .saturating_add(dialog.query.cursor() as u16);
+    f.set_cursor(cursor_x, rows[0].y);
+}
+
+fn format_updated_at_ms(updated_at_ms: u64) -> String {
+    let secs = (updated_at_ms / 1000) as i64;
+    let Some(ts) = DateTime::<Utc>::from_timestamp(secs, 0) else {
+        return "unknown-time".to_string();
+    };
+    ts.format("%Y-%m-%d %H:%M").to_string()
+}
+
 fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
     let mut out: Vec<ChatEntry> = Vec::new();
     let mut tool_input_for_id: HashMap<String, (String, serde_json::Value)> = HashMap::new();
@@ -2257,10 +3288,7 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                                 .get(tool_use_id)
                                 .cloned()
                                 .unwrap_or_else(|| {
-                                    (
-                                        format!("Tool({})", tool_use_id),
-                                        serde_json::Value::Null,
-                                    )
+                                    (format!("Tool({})", tool_use_id), serde_json::Value::Null)
                                 });
 
                             let md = format_tool_result_markdown(
@@ -2292,7 +3320,9 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                     });
                 }
             }
-            Message::Assistant(claude_core::types::message::AssistantMessage { content, .. }) => {
+            Message::Assistant(claude_core::types::message::AssistantMessage {
+                content, ..
+            }) => {
                 let mut text_buf = String::new();
 
                 for b in content {
@@ -2311,8 +3341,7 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                                 });
                             }
 
-                            tool_input_for_id
-                                .insert(id.clone(), (name.clone(), input.clone()));
+                            tool_input_for_id.insert(id.clone(), (name.clone(), input.clone()));
 
                             let md = format_tool_running_markdown(name, input);
                             out.push(ChatEntry {
@@ -2496,7 +3525,10 @@ fn persist_always_allow_tool(settings_path: &Path, tool_name: &str) -> anyhow::R
     let _lock = crate::lock_settings_path(settings_path)?;
     let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
     let Some(obj) = root.as_object_mut() else {
-        anyhow::bail!("settings root must be a JSON object: {}", settings_path.display());
+        anyhow::bail!(
+            "settings root must be a JSON object: {}",
+            settings_path.display()
+        );
     };
 
     let entry = obj
@@ -2654,7 +3686,12 @@ fn edit_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
 
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
-        Err(err) => return format!("(preview unavailable) cannot stat {}: {err}", path.display()),
+        Err(err) => {
+            return format!(
+                "(preview unavailable) cannot stat {}: {err}",
+                path.display()
+            );
+        }
     };
     if meta.is_dir() {
         return format!("(preview) path is a directory: {}", path.display());
@@ -2672,7 +3709,7 @@ fn edit_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
             return format!(
                 "(preview unavailable) failed to read {}: {err}",
                 path.display()
-            )
+            );
         }
     };
 
@@ -2728,7 +3765,10 @@ fn write_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
         return "(preview unavailable) missing required field: file_path".to_string();
     }
 
-    let content = input.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+    let content = input
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if content.chars().count() > MAX_NEW_CHARS {
         return "(preview unavailable) content is too large".to_string();
     }
@@ -2746,7 +3786,10 @@ fn write_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(err) => {
-                return format!("(preview unavailable) cannot stat {}: {err}", path.display())
+                return format!(
+                    "(preview unavailable) cannot stat {}: {err}",
+                    path.display()
+                );
             }
         };
         if meta.is_dir() {
@@ -2765,7 +3808,7 @@ fn write_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
                 return format!(
                     "(preview unavailable) failed to read {}: {err}",
                     path.display()
-                )
+                );
             }
         }
     } else {
@@ -2791,7 +3834,10 @@ fn write_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
 
 fn tool_primary_summary(tool_name: &str, input: &serde_json::Value) -> Option<String> {
     match tool_name {
-        "Bash" => input.get("command").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
+        "Bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
         "Read" | "Write" | "Edit" => input
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -2804,7 +3850,10 @@ fn tool_primary_summary(tool_name: &str, input: &serde_json::Value) -> Option<St
             .get("notebook_path")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string()),
-        "WebFetch" => input.get("url").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
+        "WebFetch" => input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
         "WebSearch" => input
             .get("query")
             .and_then(|v| v.as_str())
@@ -2849,17 +3898,24 @@ fn format_tool_result_markdown(
             out.push_str(&format!("**{tool_name}**{status}: `{preview}`\n\n"));
         } else {
             let preview = crate::truncate_chars(primary.trim(), 1200);
-            out.push_str(&format!("**{tool_name}**{status}\n\n```text\n{preview}\n```\n\n"));
+            out.push_str(&format!(
+                "**{tool_name}**{status}\n\n```text\n{preview}\n```\n\n"
+            ));
         }
     } else {
         let rendered = crate::truncate_chars(&render_value_pretty(input), 1200);
-        out.push_str(&format!("**{tool_name}**{status}\n\n```json\n{rendered}\n```\n\n"));
+        out.push_str(&format!(
+            "**{tool_name}**{status}\n\n```json\n{rendered}\n```\n\n"
+        ));
     }
 
     let (lang, body) = match (tool_name, result) {
         ("Edit", serde_json::Value::String(s)) => ("diff", crate::truncate_chars(s, 50_000)),
         (_name, serde_json::Value::String(s)) => ("text", crate::truncate_chars(s, 50_000)),
-        (_name, other) => ("json", crate::truncate_chars(&render_value_pretty(other), 50_000)),
+        (_name, other) => (
+            "json",
+            crate::truncate_chars(&render_value_pretty(other), 50_000),
+        ),
     };
 
     out.push_str("Result:\n");
@@ -2899,12 +3955,20 @@ fn tool_input_summary_plain(tool_name: &str, input: &serde_json::Value) -> Strin
             out.push_str(path);
         }
         "WebFetch" => {
-            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or_default().trim();
+            let url = input
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
             out.push_str("URL:\n");
             out.push_str(url);
         }
         "WebSearch" => {
-            let q = input.get("query").and_then(|v| v.as_str()).unwrap_or_default().trim();
+            let q = input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
             out.push_str("Query:\n");
             out.push_str(q);
         }
@@ -2917,7 +3981,11 @@ fn tool_input_summary_plain(tool_name: &str, input: &serde_json::Value) -> Strin
     crate::truncate_chars(&out, 2200)
 }
 
-fn write_session_meta_silent(session_id: SessionId, session_path: &Path, result: &claude_query::RunResult) {
+fn write_session_meta_silent(
+    session_id: SessionId,
+    session_path: &Path,
+    result: &claude_query::RunResult,
+) {
     let meta_path = session_path.with_extension("meta.json");
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
