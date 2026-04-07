@@ -63,6 +63,17 @@ struct App {
     md: MarkdownRenderer,
     history: Vec<Message>,
 
+    // Week 3: scrollback + virtualization
+    /// Start line (0-based) of the transcript viewport.
+    scroll_top: usize,
+    /// When true, keep the viewport pinned to the bottom as new content arrives.
+    scroll_follow: bool,
+    /// Last rendered height of the messages viewport (used for page scrolling).
+    last_msg_view_height: usize,
+    /// Prefix-sum of entry start lines. `line_offsets[i]` is the first line of entry `i`,
+    /// and the final element is the total line count.
+    line_offsets: Vec<usize>,
+
     session_id: SessionId,
     session_path: PathBuf,
     model: String,
@@ -161,15 +172,24 @@ impl App {
         }
     }
 
-    fn total_rendered_lines(&self) -> usize {
-        let mut total = 0usize;
+    fn recompute_line_offsets(&mut self) {
+        self.line_offsets.clear();
+        self.line_offsets
+            .reserve(self.rendered.len().saturating_add(1));
+
+        let mut acc: usize = 0;
         for entry in &self.rendered {
+            self.line_offsets.push(acc);
             // header + body + separator blank line
-            total = total.saturating_add(1);
-            total = total.saturating_add(entry.body.line_count());
-            total = total.saturating_add(1);
+            acc = acc.saturating_add(1);
+            acc = acc.saturating_add(entry.body.line_count());
+            acc = acc.saturating_add(1);
         }
-        total
+        self.line_offsets.push(acc);
+    }
+
+    fn total_rendered_lines(&self) -> usize {
+        self.line_offsets.last().copied().unwrap_or(0)
     }
 
     fn finalize_streaming(&mut self, idx: usize) {
@@ -219,22 +239,55 @@ fn role_header(role: Role) -> Line<'static> {
     Line::from(Span::styled(label, style))
 }
 
+fn entry_index_for_line(line_offsets: &[usize], line: usize) -> usize {
+    let entries = line_offsets.len().saturating_sub(1);
+    if entries == 0 {
+        return 0;
+    }
+
+    // `line_offsets` is a non-decreasing prefix sum. We want the last index `i`
+    // where `line_offsets[i] <= line`.
+    match line_offsets.binary_search(&line) {
+        Ok(i) => i.min(entries.saturating_sub(1)),
+        Err(i) => i.saturating_sub(1).min(entries.saturating_sub(1)),
+    }
+}
+
 fn render_transcript(
     f: &mut ratatui::Frame<'_>,
     app: &App,
     area: ratatui::layout::Rect,
     start_line: usize,
 ) {
-    let mut global_line: usize = 0;
-    let mut row: u16 = 0;
+    if area.height == 0 || app.rendered.is_empty() {
+        return;
+    }
 
-    for entry in &app.rendered {
+    // Week 3: virtual scrolling. Use `line_offsets` to jump straight to the first
+    // entry intersecting `start_line` and only iterate the visible tail.
+    let entries = app.rendered.len();
+    if app.line_offsets.len() != entries.saturating_add(1) {
+        return;
+    }
+    let total_lines = app.total_rendered_lines();
+    if total_lines == 0 {
+        return;
+    }
+    if start_line >= total_lines {
+        return;
+    }
+
+    let start_idx = entry_index_for_line(&app.line_offsets, start_line);
+    let mut skip_in_entry = start_line.saturating_sub(app.line_offsets[start_idx]);
+
+    let mut row: u16 = 0;
+    for entry in app.rendered.iter().skip(start_idx) {
         if row >= area.height {
             break;
         }
 
-        // Header line
-        if global_line >= start_line && row < area.height {
+        // Header (1 line)
+        if skip_in_entry == 0 {
             let line_area = ratatui::layout::Rect {
                 x: area.x,
                 y: area.y.saturating_add(row),
@@ -243,58 +296,58 @@ fn render_transcript(
             };
             f.render_widget(&entry.header, line_area);
             row = row.saturating_add(1);
-        }
-        global_line = global_line.saturating_add(1);
-
-        // Body lines
-        match &entry.body {
-            RenderedBody::Static(lines) => {
-                for line in lines {
-                    if row >= area.height {
-                        break;
-                    }
-                    if global_line >= start_line {
-                        let line_area = ratatui::layout::Rect {
-                            x: area.x,
-                            y: area.y.saturating_add(row),
-                            width: area.width,
-                            height: 1,
-                        };
-                        f.render_widget(line, line_area);
-                        row = row.saturating_add(1);
-                    }
-                    global_line = global_line.saturating_add(1);
-                }
-            }
-            RenderedBody::Streaming(stream) => {
-                for line in stream.iter_lines() {
-                    if row >= area.height {
-                        break;
-                    }
-                    if global_line >= start_line {
-                        let line_area = ratatui::layout::Rect {
-                            x: area.x,
-                            y: area.y.saturating_add(row),
-                            width: area.width,
-                            height: 1,
-                        };
-                        f.render_widget(line, line_area);
-                        row = row.saturating_add(1);
-                    }
-                    global_line = global_line.saturating_add(1);
-                }
-            }
+        } else {
+            skip_in_entry = skip_in_entry.saturating_sub(1);
         }
 
         if row >= area.height {
             break;
         }
 
-        // Blank separator line between entries.
-        if global_line >= start_line && row < area.height {
-            row = row.saturating_add(1);
+        // Body (N lines)
+        let body_len = entry.body.line_count();
+        let body_skip = skip_in_entry.min(body_len);
+        match &entry.body {
+            RenderedBody::Static(lines) => {
+                for line in lines.iter().skip(body_skip) {
+                    if row >= area.height {
+                        break;
+                    }
+                    let line_area = ratatui::layout::Rect {
+                        x: area.x,
+                        y: area.y.saturating_add(row),
+                        width: area.width,
+                        height: 1,
+                    };
+                    f.render_widget(line, line_area);
+                    row = row.saturating_add(1);
+                }
+            }
+            RenderedBody::Streaming(stream) => {
+                for line in stream.iter_lines().skip(body_skip) {
+                    if row >= area.height {
+                        break;
+                    }
+                    let line_area = ratatui::layout::Rect {
+                        x: area.x,
+                        y: area.y.saturating_add(row),
+                        width: area.width,
+                        height: 1,
+                    };
+                    f.render_widget(line, line_area);
+                    row = row.saturating_add(1);
+                }
+            }
         }
-        global_line = global_line.saturating_add(1);
+        if row >= area.height {
+            break;
+        }
+
+        // Separator blank line (1 line).
+        row = row.saturating_add(1);
+
+        // After the first entry, we should never need to skip again.
+        skip_in_entry = 0;
     }
 }
 
@@ -355,6 +408,10 @@ pub async fn run_tui(
         render_width: 0,
         md,
         history,
+        scroll_top: 0,
+        scroll_follow: true,
+        last_msg_view_height: 0,
+        line_offsets: Vec::new(),
         session_id,
         session_path,
         model: model.clone(),
@@ -459,6 +516,30 @@ async fn build_engine(
     Ok(std::sync::Arc::new(engine))
 }
 
+fn scroll_up(app: &mut App, amount: usize) {
+    if amount == 0 {
+        return;
+    }
+    app.scroll_top = app.scroll_top.saturating_sub(amount);
+    app.scroll_follow = false;
+}
+
+fn scroll_down(app: &mut App, amount: usize) {
+    if amount == 0 {
+        return;
+    }
+    app.scroll_top = app.scroll_top.saturating_add(amount);
+}
+
+fn scroll_to_top(app: &mut App) {
+    app.scroll_top = 0;
+    app.scroll_follow = false;
+}
+
+fn scroll_to_bottom(app: &mut App) {
+    app.scroll_follow = true;
+}
+
 async fn handle_term_event(
     app: &mut App,
     ev: Event,
@@ -479,6 +560,27 @@ async fn handle_term_event(
             }
 
             match key.code {
+                // Week 3: scrollback.
+                KeyCode::Up => {
+                    scroll_up(app, 1);
+                }
+                KeyCode::Down => {
+                    scroll_down(app, 1);
+                }
+                KeyCode::PageUp => {
+                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
+                    scroll_up(app, amount);
+                }
+                KeyCode::PageDown => {
+                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
+                    scroll_down(app, amount);
+                }
+                KeyCode::Home => {
+                    scroll_to_top(app);
+                }
+                KeyCode::End => {
+                    scroll_to_bottom(app);
+                }
                 KeyCode::Esc => {
                     app.input.clear();
                 }
@@ -529,6 +631,9 @@ fn submit_prompt(
     });
     app.rendered.push(RenderedEntry::new_streaming(Role::Assistant));
     app.active_assistant_idx = Some(app.transcript.len().saturating_sub(1));
+
+    // Week 3: make sure the new turn is visible even if the user had scrolled up.
+    scroll_to_bottom(app);
 
     app.status = "thinking...".to_string();
     app.in_flight = true;
@@ -669,10 +774,21 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let inner_w = inner.width.max(1) as usize;
     let inner_h = inner.height.max(1) as usize;
 
+    app.last_msg_view_height = inner_h;
     app.ensure_rendered(inner_w);
+    app.recompute_line_offsets();
     let total_lines = app.total_rendered_lines();
-    let scroll_y = total_lines.saturating_sub(inner_h);
-    render_transcript(f, app, inner, scroll_y);
+    let max_scroll = total_lines.saturating_sub(inner_h);
+    if app.scroll_follow {
+        app.scroll_top = max_scroll;
+    } else {
+        app.scroll_top = app.scroll_top.min(max_scroll);
+        if app.scroll_top == max_scroll {
+            // Re-enable follow when the user scrolls back to the bottom.
+            app.scroll_follow = true;
+        }
+    }
+    render_transcript(f, app, inner, app.scroll_top);
 
     // Input
     let input_block = Block::default().borders(Borders::ALL).title("Input");
@@ -695,7 +811,12 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         " "
     };
-    let status = Line::from(format!("{spin} {}", app.status))
+    let scroll_hint = if app.scroll_follow {
+        ""
+    } else {
+        " • scroll locked (End to follow)"
+    };
+    let status = Line::from(format!("{spin} {}{scroll_hint}", app.status))
         .style(Style::default().fg(Color::Gray).add_modifier(Modifier::DIM));
     f.render_widget(Paragraph::new(status), chunks[3]);
 }
