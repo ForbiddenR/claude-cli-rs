@@ -13,12 +13,16 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::args::{Args, InputFormat, OutputFormat};
+
+mod markdown;
+
+use markdown::{MarkdownRenderer, StreamingMarkdown};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -35,7 +39,17 @@ struct ChatEntry {
     text: String,
 }
 
-#[derive(Debug)]
+struct RenderedEntry {
+    header: Line<'static>,
+    body: RenderedBody,
+    dirty: bool,
+}
+
+enum RenderedBody {
+    Static(Vec<Line<'static>>),
+    Streaming(StreamingMarkdown),
+}
+
 struct App {
     input: String,
     status: String,
@@ -44,6 +58,9 @@ struct App {
     active_assistant_idx: Option<usize>,
 
     transcript: Vec<ChatEntry>,
+    rendered: Vec<RenderedEntry>,
+    render_width: usize,
+    md: MarkdownRenderer,
     history: Vec<Message>,
 
     session_id: SessionId,
@@ -72,6 +89,212 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+impl RenderedEntry {
+    fn new(role: Role) -> Self {
+        Self {
+            header: role_header(role),
+            body: RenderedBody::Static(Vec::new()),
+            dirty: true,
+        }
+    }
+
+    fn new_streaming(role: Role) -> Self {
+        Self {
+            header: role_header(role),
+            body: RenderedBody::Streaming(StreamingMarkdown::new()),
+            dirty: true,
+        }
+    }
+}
+
+impl RenderedBody {
+    fn line_count(&self) -> usize {
+        match self {
+            Self::Static(lines) => lines.len(),
+            Self::Streaming(stream) => stream.line_count(),
+        }
+    }
+}
+
+impl App {
+    fn ensure_rendered(&mut self, width: usize) {
+        let width = width.max(1);
+
+        if self.render_width != width {
+            self.render_width = width;
+            for entry in &mut self.rendered {
+                entry.dirty = true;
+                if let RenderedBody::Streaming(stream) = &mut entry.body {
+                    stream.reset();
+                }
+            }
+        }
+
+        // Defensive: keep caches aligned even if a future edit forgets to push/pop both.
+        while self.rendered.len() < self.transcript.len() {
+            let role = self.transcript[self.rendered.len()].role;
+            self.rendered.push(RenderedEntry::new(role));
+        }
+        if self.rendered.len() > self.transcript.len() {
+            self.rendered.truncate(self.transcript.len());
+        }
+
+        for (idx, cache) in self.rendered.iter_mut().enumerate() {
+            if !cache.dirty {
+                continue;
+            }
+            let Some(entry) = self.transcript.get(idx) else {
+                continue;
+            };
+            match &mut cache.body {
+                RenderedBody::Static(lines) => {
+                    *lines = self.md.render(&entry.text, width);
+                }
+                RenderedBody::Streaming(stream) => {
+                    stream.update(&entry.text, &self.md, width);
+                }
+            }
+            cache.dirty = false;
+        }
+    }
+
+    fn total_rendered_lines(&self) -> usize {
+        let mut total = 0usize;
+        for entry in &self.rendered {
+            // header + body + separator blank line
+            total = total.saturating_add(1);
+            total = total.saturating_add(entry.body.line_count());
+            total = total.saturating_add(1);
+        }
+        total
+    }
+
+    fn finalize_streaming(&mut self, idx: usize) {
+        let width = self.render_width.max(1);
+
+        let text = match self.transcript.get(idx) {
+            Some(e) => e.text.clone(),
+            None => return,
+        };
+
+        let Some(cache) = self.rendered.get_mut(idx) else {
+            return;
+        };
+
+        let body = std::mem::replace(&mut cache.body, RenderedBody::Static(Vec::new()));
+        match body {
+            RenderedBody::Streaming(stream) => {
+                let lines = stream.into_static(&text, &self.md, width);
+                cache.body = RenderedBody::Static(lines);
+            }
+            other => {
+                cache.body = other;
+            }
+        }
+        cache.dirty = false;
+    }
+}
+
+fn role_header(role: Role) -> Line<'static> {
+    let (label, style) = match role {
+        Role::User => (
+            "You",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Role::Assistant => (
+            "Claude",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Role::System => (
+            "System",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::DIM),
+        ),
+    };
+
+    Line::from(Span::styled(label, style))
+}
+
+fn render_transcript(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    area: ratatui::layout::Rect,
+    start_line: usize,
+) {
+    let mut global_line: usize = 0;
+    let mut row: u16 = 0;
+
+    for entry in &app.rendered {
+        if row >= area.height {
+            break;
+        }
+
+        // Header line
+        if global_line >= start_line && row < area.height {
+            let line_area = ratatui::layout::Rect {
+                x: area.x,
+                y: area.y.saturating_add(row),
+                width: area.width,
+                height: 1,
+            };
+            f.render_widget(&entry.header, line_area);
+            row = row.saturating_add(1);
+        }
+        global_line = global_line.saturating_add(1);
+
+        // Body lines
+        match &entry.body {
+            RenderedBody::Static(lines) => {
+                for line in lines {
+                    if row >= area.height {
+                        break;
+                    }
+                    if global_line >= start_line {
+                        let line_area = ratatui::layout::Rect {
+                            x: area.x,
+                            y: area.y.saturating_add(row),
+                            width: area.width,
+                            height: 1,
+                        };
+                        f.render_widget(line, line_area);
+                        row = row.saturating_add(1);
+                    }
+                    global_line = global_line.saturating_add(1);
+                }
+            }
+            RenderedBody::Streaming(stream) => {
+                for line in stream.iter_lines() {
+                    if row >= area.height {
+                        break;
+                    }
+                    if global_line >= start_line {
+                        let line_area = ratatui::layout::Rect {
+                            x: area.x,
+                            y: area.y.saturating_add(row),
+                            width: area.width,
+                            height: 1,
+                        };
+                        f.render_widget(line, line_area);
+                        row = row.saturating_add(1);
+                    }
+                    global_line = global_line.saturating_add(1);
+                }
+            }
+        }
+
+        if row >= area.height {
+            break;
+        }
+
+        // Blank separator line between entries.
+        if global_line >= start_line && row < area.height {
+            row = row.saturating_add(1);
+        }
+        global_line = global_line.saturating_add(1);
     }
 }
 
@@ -110,6 +333,8 @@ pub async fn run_tui(
 
     let model = crate::resolve_model(args.model.clone(), settings.model.clone());
 
+    let md = MarkdownRenderer::new();
+
     let mut transcript = transcript_from_history(&history);
     if transcript.is_empty() {
         transcript.push(ChatEntry {
@@ -117,6 +342,7 @@ pub async fn run_tui(
             text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
         });
     }
+    let rendered = transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
 
     let mut app = App {
         input: String::new(),
@@ -125,6 +351,9 @@ pub async fn run_tui(
         in_flight: false,
         active_assistant_idx: None,
         transcript,
+        rendered,
+        render_width: 0,
+        md,
         history,
         session_id,
         session_path,
@@ -142,7 +371,7 @@ pub async fn run_tui(
 
     loop {
         terminal
-            .draw(|f| render(f, &app))
+            .draw(|f| render(f, &mut app))
             .context("render")?;
 
         tokio::select! {
@@ -292,10 +521,13 @@ fn submit_prompt(
         role: Role::User,
         text: prompt.clone(),
     });
+    app.rendered.push(RenderedEntry::new(Role::User));
+
     app.transcript.push(ChatEntry {
         role: Role::Assistant,
         text: String::new(),
     });
+    app.rendered.push(RenderedEntry::new_streaming(Role::Assistant));
     app.active_assistant_idx = Some(app.transcript.len().saturating_sub(1));
 
     app.status = "thinking...".to_string();
@@ -345,21 +577,34 @@ fn submit_prompt(
 fn handle_query_event(app: &mut App, qev: QueryEvent) {
     match qev {
         QueryEvent::TextDelta(delta) => {
-            let idx = app.active_assistant_idx.unwrap_or_else(|| {
-                app.transcript.push(ChatEntry {
-                    role: Role::Assistant,
-                    text: String::new(),
-                });
-                app.transcript.len().saturating_sub(1)
-            });
+            let idx = match app.active_assistant_idx {
+                Some(idx) => idx,
+                None => {
+                    app.transcript.push(ChatEntry {
+                        role: Role::Assistant,
+                        text: String::new(),
+                    });
+                    app.rendered.push(RenderedEntry::new_streaming(Role::Assistant));
+                    let idx = app.transcript.len().saturating_sub(1);
+                    app.active_assistant_idx = Some(idx);
+                    idx
+                }
+            };
             if let Some(entry) = app.transcript.get_mut(idx) {
                 entry.text.push_str(&delta);
             }
+            if let Some(cache) = app.rendered.get_mut(idx) {
+                cache.dirty = true;
+            }
         }
         QueryEvent::Finished(result) => {
+            let finished_idx = app.active_assistant_idx;
             app.in_flight = false;
             app.active_assistant_idx = None;
             app.history = result.history;
+            if let Some(idx) = finished_idx {
+                app.finalize_streaming(idx);
+            }
 
             app.status = match result.cost_usd {
                 Some(cost) => format!(
@@ -380,6 +625,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             if let Some(last) = app.transcript.last() {
                 if last.role == Role::Assistant && last.text.is_empty() {
                     app.transcript.pop();
+                    app.rendered.pop();
                 }
             }
 
@@ -388,11 +634,12 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 role: Role::System,
                 text: format!("error: {err}"),
             });
+            app.rendered.push(RenderedEntry::new(Role::System));
         }
     }
 }
 
-fn render(f: &mut ratatui::Frame<'_>, app: &App) {
+fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let size = f.size();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -414,17 +661,18 @@ fn render(f: &mut ratatui::Frame<'_>, app: &App) {
 
     // Messages
     let msg_block = Block::default().borders(Borders::ALL).title("Messages");
-    let inner_w = msg_block.inner(chunks[1]).width.max(1) as usize;
-    let inner_h = msg_block.inner(chunks[1]).height.max(1) as usize;
+    f.render_widget(&msg_block, chunks[1]);
 
-    let lines = transcript_lines(&app.transcript, inner_w);
-    let scroll_y = lines.len().saturating_sub(inner_h);
-    let text = Text::from(lines.into_iter().map(Line::raw).collect::<Vec<_>>());
+    let inner = msg_block.inner(chunks[1]);
+    f.render_widget(ratatui::widgets::Clear, inner);
 
-    let messages = Paragraph::new(text)
-        .block(msg_block)
-        .scroll((scroll_y.min(u16::MAX as usize) as u16, 0));
-    f.render_widget(messages, chunks[1]);
+    let inner_w = inner.width.max(1) as usize;
+    let inner_h = inner.height.max(1) as usize;
+
+    app.ensure_rendered(inner_w);
+    let total_lines = app.total_rendered_lines();
+    let scroll_y = total_lines.saturating_sub(inner_h);
+    render_transcript(f, app, inner, scroll_y);
 
     // Input
     let input_block = Block::default().borders(Borders::ALL).title("Input");
@@ -492,60 +740,6 @@ fn extract_text_blocks(blocks: &[ContentBlock]) -> String {
             _ => {}
         }
     }
-    out
-}
-
-fn transcript_lines(entries: &[ChatEntry], width: usize) -> Vec<String> {
-    let width = width.max(1);
-
-    let mut out: Vec<String> = Vec::new();
-    for (idx, e) in entries.iter().enumerate() {
-        if idx > 0 {
-            out.push(String::new());
-        }
-
-        let prefix = match e.role {
-            Role::User => "You: ",
-            Role::Assistant => "Claude: ",
-            Role::System => "",
-        };
-
-        let mut first = true;
-        for raw_line in e.text.split('\n') {
-            if first {
-                let line = format!("{prefix}{raw_line}");
-                out.extend(wrap_by_chars(&line, width));
-                first = false;
-            } else {
-                out.extend(wrap_by_chars(raw_line, width));
-            }
-        }
-        if e.text.is_empty() && !prefix.is_empty() {
-            out.push(prefix.trim_end().to_string());
-        }
-    }
-    out
-}
-
-fn wrap_by_chars(s: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut col: usize = 0;
-
-    for ch in s.chars() {
-        buf.push(ch);
-        col += 1;
-        if col >= width {
-            out.push(std::mem::take(&mut buf));
-            col = 0;
-        }
-    }
-
-    if !buf.is_empty() || out.is_empty() {
-        out.push(buf);
-    }
-
     out
 }
 
