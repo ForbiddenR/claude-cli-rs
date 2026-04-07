@@ -9,14 +9,17 @@ use claude_core::types::ids::SessionId;
 use claude_core::types::message::{ContentBlock, Message, UserMessage};
 use claude_core::types::permissions::PermissionMode;
 use claude_services::auth::AuthMode;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use similar::TextDiff;
@@ -24,11 +27,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::args::{Args, InputFormat, OutputFormat};
 
+mod input;
 mod markdown;
 
+use input::{InputBuffer, PromptHistory, ReverseHistorySearch};
 use markdown::{MarkdownRenderer, StreamingMarkdown};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+const MAX_INPUT_VISIBLE_LINES: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -56,7 +62,9 @@ enum RenderedBody {
 }
 
 struct App {
-    input: String,
+    input: InputBuffer,
+    prompt_history: PromptHistory,
+    reverse_history_search: Option<ReverseHistorySearch>,
     status: String,
     spinner_idx: usize,
     in_flight: bool,
@@ -190,7 +198,8 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
         terminal::enable_raw_mode().context("enable raw mode")?;
-        execute!(std::io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(std::io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
+            .context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -198,7 +207,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -507,6 +516,8 @@ pub async fn run_tui(
 
     let md = MarkdownRenderer::new();
 
+    let prompt_history = PromptHistory::new(prompt_history_from_messages(&history));
+
     let mut transcript = transcript_from_history(&history);
     if transcript.is_empty() {
         transcript.push(ChatEntry {
@@ -517,7 +528,9 @@ pub async fn run_tui(
     let rendered = transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
 
     let mut app = App {
-        input: String::new(),
+        input: InputBuffer::new(),
+        prompt_history,
+        reverse_history_search: None,
         status: "ready".to_string(),
         spinner_idx: 0,
         in_flight: false,
@@ -674,15 +687,31 @@ async fn handle_term_event(
     query_tx: mpsc::UnboundedSender<QueryEvent>,
 ) -> anyhow::Result<bool> {
     match ev {
+        Event::Paste(text) => {
+            if app.permission_prompt.is_some() {
+                return Ok(false);
+            }
+
+            if let Some(search) = app.reverse_history_search.as_mut() {
+                let mut q = text.replace('\n', " ");
+                q = q.replace('\r', " ");
+                search.push_str(q.trim_end(), app.prompt_history.entries(), &mut app.input);
+            } else {
+                app.input.insert_str(&text);
+            }
+        }
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return Ok(false);
             }
 
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('c') => return Ok(true),
-                    _ => {}
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
+
+            if ctrl {
+                if let KeyCode::Char('c') = key.code {
+                    return Ok(true);
                 }
             }
 
@@ -749,14 +778,107 @@ async fn handle_term_event(
                 return Ok(false);
             }
 
+            if let Some(mut search) = app.reverse_history_search.take() {
+                let history = app.prompt_history.entries();
+                let keep_search = match key.code {
+                    KeyCode::Char('r') | KeyCode::Char('R') if ctrl => {
+                        search.next_match(history, &mut app.input);
+                        true
+                    }
+                    KeyCode::Char('g') | KeyCode::Char('G') if ctrl => {
+                        search.cancel(&mut app.input);
+                        false
+                    }
+                    KeyCode::Esc => {
+                        search.cancel(&mut app.input);
+                        false
+                    }
+                    KeyCode::Enter => {
+                        search.accept();
+                        false
+                    }
+                    KeyCode::Backspace => {
+                        search.backspace(history, &mut app.input);
+                        true
+                    }
+                    KeyCode::Char(ch) if !ctrl && !alt => {
+                        search.push_char(ch, history, &mut app.input);
+                        true
+                    }
+                    _ => true,
+                };
+
+                if keep_search {
+                    app.reverse_history_search = Some(search);
+                }
+                return Ok(false);
+            }
+
+            if ctrl {
+                match key.code {
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        let mut search = ReverseHistorySearch::new(
+                            &app.input,
+                            app.prompt_history.entries().len(),
+                        );
+                        search.search_next(app.prompt_history.entries(), &mut app.input);
+                        app.reverse_history_search = Some(search);
+                        return Ok(false);
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        app.input.move_to_start(selecting);
+                        return Ok(false);
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        app.input.move_to_end(selecting);
+                        return Ok(false);
+                    }
+                    KeyCode::Left => {
+                        app.input.move_word_left(selecting);
+                        return Ok(false);
+                    }
+                    KeyCode::Right => {
+                        app.input.move_word_right(selecting);
+                        return Ok(false);
+                    }
+                    // Week 3: scrollback. Up/Down are history navigation, so use Ctrl+Up/Down.
+                    KeyCode::Up => {
+                        scroll_up(app, 1);
+                        return Ok(false);
+                    }
+                    KeyCode::Down => {
+                        scroll_down(app, 1);
+                        return Ok(false);
+                    }
+                    KeyCode::Home => {
+                        scroll_to_top(app);
+                        return Ok(false);
+                    }
+                    KeyCode::End => {
+                        scroll_to_bottom(app);
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+
             match key.code {
-                // Week 3: scrollback.
+                // Week 6: command history.
                 KeyCode::Up => {
-                    scroll_up(app, 1);
+                    if alt {
+                        app.input.move_up_line(selecting);
+                    } else {
+                        app.prompt_history.prev(&mut app.input);
+                    }
                 }
                 KeyCode::Down => {
-                    scroll_down(app, 1);
+                    if alt {
+                        app.input.move_down_line(selecting);
+                    } else {
+                        app.prompt_history.next(&mut app.input);
+                    }
                 }
+                // Week 3: scrollback.
                 KeyCode::PageUp => {
                     let amount = app.last_msg_view_height.saturating_sub(1).max(1);
                     scroll_up(app, amount);
@@ -766,23 +888,54 @@ async fn handle_term_event(
                     scroll_down(app, amount);
                 }
                 KeyCode::Home => {
-                    scroll_to_top(app);
+                    app.input.move_to_start(selecting);
                 }
                 KeyCode::End => {
-                    scroll_to_bottom(app);
+                    app.input.move_to_end(selecting);
                 }
                 KeyCode::Esc => {
-                    app.input.clear();
+                    if app.input.has_selection() {
+                        app.input.clear_selection();
+                    } else if app.prompt_history.is_navigating() {
+                        app.prompt_history.cancel_navigation(&mut app.input);
+                    } else {
+                        app.input.clear();
+                    }
                 }
                 KeyCode::Backspace => {
-                    app.input.pop();
+                    app.input.backspace();
                 }
+                KeyCode::Delete => {
+                    app.input.delete_forward();
+                }
+                KeyCode::Left => {
+                    if alt {
+                        app.input.move_word_left(selecting);
+                    } else {
+                        app.input.move_left(selecting);
+                    }
+                }
+                KeyCode::Right => {
+                    if alt {
+                        app.input.move_word_right(selecting);
+                    } else {
+                        app.input.move_right(selecting);
+                    }
+                }
+                // Week 6: multi-line input.
                 KeyCode::Enter => {
-                    submit_prompt(app, engine.clone(), query_tx)?;
+                    if alt {
+                        app.input.insert_char('\n');
+                    } else {
+                        submit_prompt(app, engine.clone(), query_tx)?;
+                    }
+                }
+                KeyCode::Tab => {
+                    app.input.insert_char('\t');
                 }
                 KeyCode::Char(ch) => {
-                    if !app.in_flight {
-                        app.input.push(ch);
+                    if !ctrl && !alt {
+                        app.input.insert_char(ch);
                     }
                 }
                 _ => {}
@@ -793,7 +946,6 @@ async fn handle_term_event(
     }
     Ok(false)
 }
-
 fn submit_prompt(
     app: &mut App,
     engine: std::sync::Arc<claude_query::QueryEngine>,
@@ -803,10 +955,14 @@ fn submit_prompt(
         return Ok(());
     }
 
-    let prompt = app.input.trim().to_string();
-    if prompt.is_empty() {
+    let prompt = app.input.as_str().to_string();
+    if prompt.trim().is_empty() {
         return Ok(());
     }
+
+    app.prompt_history.push(prompt.clone());
+    app.prompt_history.reset_navigation();
+    app.reverse_history_search = None;
     app.input.clear();
     app.permission_prompt = None;
     app.tool_entry_for_id.clear();
@@ -996,14 +1152,175 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
     }
 }
 
+struct PreparedInput {
+    text: Text<'static>,
+    cursor_row: usize,
+    cursor_col: usize,
+    visible_line_count: usize,
+}
+
+fn prompt_history_from_messages(history: &[Message]) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for msg in history {
+        let Message::User(UserMessage { content }) = msg else {
+            continue;
+        };
+
+        let mut text_buf = String::new();
+        for block in content {
+            if let ContentBlock::Text { text } = block {
+                if !text_buf.is_empty() {
+                    text_buf.push('\n');
+                }
+                text_buf.push_str(text);
+            }
+        }
+
+        if !text_buf.trim().is_empty() {
+            out.push(text_buf);
+        }
+    }
+
+    out
+}
+
+fn prepare_input_render(input: &InputBuffer, width: usize, max_lines: usize) -> PreparedInput {
+    let width = width.max(1);
+    let selection = input.selection_range();
+    let mut raw_lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut row: usize = 0;
+    let mut col: usize = 0;
+    let mut cursor_row: usize = 0;
+    let mut cursor_col: usize = 0;
+
+    let plain = Style::default();
+    let selected = Style::default().fg(Color::Black).bg(Color::Blue);
+
+    if input.cursor() == 0 {
+        cursor_row = 0;
+        cursor_col = 0;
+    }
+
+    for (byte_idx, ch) in input.as_str().char_indices() {
+        if ch == '\n' {
+            raw_lines.push(std::mem::take(&mut current));
+            row = row.saturating_add(1);
+            col = 0;
+
+            let next_idx = byte_idx.saturating_add(ch.len_utf8());
+            if input.cursor() == next_idx {
+                cursor_row = row;
+                cursor_col = col;
+            }
+            continue;
+        }
+
+        let style = if selection
+            .map(|(start, end)| byte_idx >= start && byte_idx < end)
+            .unwrap_or(false)
+        {
+            selected
+        } else {
+            plain
+        };
+
+        let display = if ch == '\t' {
+            String::from("    ")
+        } else {
+            ch.to_string()
+        };
+
+        for disp in display.chars() {
+            current.push(Span::styled(disp.to_string(), style));
+            col = col.saturating_add(1);
+            if col >= width {
+                raw_lines.push(std::mem::take(&mut current));
+                row = row.saturating_add(1);
+                col = 0;
+            }
+        }
+
+        let next_idx = byte_idx.saturating_add(ch.len_utf8());
+        if input.cursor() == next_idx {
+            cursor_row = row;
+            cursor_col = col;
+        }
+    }
+
+    raw_lines.push(std::mem::take(&mut current));
+    if raw_lines.is_empty() {
+        raw_lines.push(Vec::new());
+    }
+
+    let total_lines = raw_lines.len().max(1);
+    let max_lines = max_lines.max(1);
+    let visible_line_count = total_lines.clamp(1, max_lines);
+    let scroll_top = cursor_row
+        .saturating_add(1)
+        .saturating_sub(visible_line_count);
+
+    let lines = raw_lines
+        .into_iter()
+        .skip(scroll_top)
+        .take(visible_line_count)
+        .map(|spans| {
+            if spans.is_empty() {
+                Line::from("")
+            } else {
+                Line::from(spans)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    PreparedInput {
+        text: Text::from(lines),
+        cursor_row: cursor_row.saturating_sub(scroll_top),
+        cursor_col,
+        visible_line_count,
+    }
+}
+
+fn render_status_line(app: &App, spin: &str) -> Line<'static> {
+    let style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
+
+    if let Some(search) = &app.reverse_history_search {
+        let query = search.query();
+        let preview = crate::one_line_preview(app.input.as_str(), 80);
+        let body = format!(
+            "{spin} reverse-i-search `{query}`: {preview} • Enter accept • Esc cancel • Ctrl+R older"
+        );
+        return Line::from(body).style(style);
+    }
+
+    let scroll_hint = if app.scroll_follow {
+        ""
+    } else {
+        " • scroll locked (Ctrl+End to follow)"
+    };
+    let input_hint = if app.in_flight {
+        ""
+    } else {
+        " • Alt+Enter newline • Up/Down history • Ctrl+R search"
+    };
+
+    Line::from(format!("{spin} {}{scroll_hint}{input_hint}", app.status)).style(style)
+}
+
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let size = f.size();
+    let max_input_lines = size.height.saturating_sub(5).max(1) as usize;
+    let max_input_lines = max_input_lines.min(MAX_INPUT_VISIBLE_LINES);
+    let estimated_input = prepare_input_render(&app.input, size.width.saturating_sub(2) as usize, max_input_lines);
+    let input_height = estimated_input.visible_line_count.max(1) as u16 + 2;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(size);
@@ -1043,15 +1360,20 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     render_transcript(f, app, inner, app.scroll_top);
 
     // Input
-    let input_block = Block::default().borders(Borders::ALL).title("Input");
-    let input_inner_w = input_block.inner(chunks[2]).width.max(1) as usize;
-    let visible = take_last_chars(&app.input, input_inner_w);
-    let input = Paragraph::new(visible.clone()).block(input_block);
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Input • Alt+Enter newline • Up/Down history");
+    let input_inner = input_block.inner(chunks[2]);
+    let input_layout = prepare_input_render(
+        &app.input,
+        input_inner.width.max(1) as usize,
+        input_inner.height.max(1) as usize,
+    );
+    let input = Paragraph::new(input_layout.text.clone()).block(input_block);
     f.render_widget(input, chunks[2]);
 
-    let cursor_x = visible.chars().count().min(input_inner_w) as u16;
-    let cursor_y = chunks[2].y + 1;
-    let cursor_x = chunks[2].x + 1 + cursor_x;
+    let cursor_x = chunks[2].x + 1 + input_layout.cursor_col as u16;
+    let cursor_y = chunks[2].y + 1 + input_layout.cursor_row as u16;
     if app.permission_prompt.is_none() {
         f.set_cursor(cursor_x, cursor_y);
     }
@@ -1065,13 +1387,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         " "
     };
-    let scroll_hint = if app.scroll_follow {
-        ""
-    } else {
-        " • scroll locked (End to follow)"
-    };
-    let status = Line::from(format!("{spin} {}{scroll_hint}", app.status))
-        .style(Style::default().fg(Color::Gray).add_modifier(Modifier::DIM));
+    let status = render_status_line(app, spin);
     f.render_widget(Paragraph::new(status), chunks[3]);
 
     // Week 4: permission modal overlay.
@@ -1079,7 +1395,6 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         render_permission_modal(f, prompt, size);
     }
 }
-
 fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let percent_x = percent_x.min(100).max(1);
     let percent_y = percent_y.min(100).max(1);
@@ -1828,15 +2143,6 @@ fn tool_input_summary_plain(tool_name: &str, input: &serde_json::Value) -> Strin
     }
 
     crate::truncate_chars(&out, 2200)
-}
-
-fn take_last_chars(s: &str, max: usize) -> String {
-    let max = max.max(1);
-    let count = s.chars().count();
-    if count <= max {
-        return s.to_string();
-    }
-    s.chars().skip(count - max).collect()
 }
 
 fn write_session_meta_silent(session_id: SessionId, session_path: &Path, result: &claude_query::RunResult) {
