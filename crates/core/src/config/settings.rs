@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, Result, config::mcp::McpServerConfig, types::permissions::PermissionMode};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorMode {
+    Normal,
+    Vim,
+    #[serde(alias = "emacs")]
+    Emacs,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +84,14 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub custom_system_prompt: Option<String>,
+
+    #[serde(
+        default,
+        rename = "editorMode",
+        alias = "editor_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub editor_mode: Option<EditorMode>,
 }
 
 impl Settings {
@@ -122,6 +139,9 @@ impl Settings {
             }
             if layer.custom_system_prompt.is_some() {
                 out.custom_system_prompt = layer.custom_system_prompt.clone();
+            }
+            if layer.editor_mode.is_some() {
+                out.editor_mode = layer.editor_mode;
             }
 
             if let Some(env) = &layer.env {

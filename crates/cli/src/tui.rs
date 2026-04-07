@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use claude_core::config::settings::EditorMode;
 use claude_core::types::ids::SessionId;
 use claude_core::types::message::{ContentBlock, Message, UserMessage};
 use claude_core::types::permissions::PermissionMode;
@@ -29,9 +30,11 @@ use crate::args::{Args, InputFormat, OutputFormat};
 
 mod input;
 mod markdown;
+mod vim;
 
 use input::{InputBuffer, PromptHistory, ReverseHistorySearch};
 use markdown::{MarkdownRenderer, StreamingMarkdown};
+use vim::{VimHandleResult, VimKey, VimMachine, VimMode};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const MAX_INPUT_VISIBLE_LINES: usize = 6;
@@ -65,6 +68,7 @@ struct App {
     input: InputBuffer,
     prompt_history: PromptHistory,
     reverse_history_search: Option<ReverseHistorySearch>,
+    vim: Option<VimMachine>,
     status: String,
     spinner_idx: usize,
     in_flight: bool,
@@ -517,6 +521,7 @@ pub async fn run_tui(
     let md = MarkdownRenderer::new();
 
     let prompt_history = PromptHistory::new(prompt_history_from_messages(&history));
+    let vim = matches!(settings.editor_mode, Some(EditorMode::Vim)).then(VimMachine::new);
 
     let mut transcript = transcript_from_history(&history);
     if transcript.is_empty() {
@@ -531,6 +536,7 @@ pub async fn run_tui(
         input: InputBuffer::new(),
         prompt_history,
         reverse_history_search: None,
+        vim,
         status: "ready".to_string(),
         spinner_idx: 0,
         in_flight: false,
@@ -680,6 +686,23 @@ fn scroll_to_bottom(app: &mut App) {
     app.scroll_follow = true;
 }
 
+fn vim_key_from_code(code: KeyCode) -> Option<VimKey> {
+    match code {
+        KeyCode::Char(ch) => Some(VimKey::Char(ch)),
+        KeyCode::Left => Some(VimKey::Left),
+        KeyCode::Right => Some(VimKey::Right),
+        KeyCode::Up => Some(VimKey::Up),
+        KeyCode::Down => Some(VimKey::Down),
+        KeyCode::Backspace => Some(VimKey::Backspace),
+        KeyCode::Delete => Some(VimKey::Delete),
+        KeyCode::Enter => Some(VimKey::Enter),
+        KeyCode::Esc => Some(VimKey::Esc),
+        KeyCode::Home => Some(VimKey::Char('0')),
+        KeyCode::End => Some(VimKey::Char('$')),
+        _ => None,
+    }
+}
+
 async fn handle_term_event(
     app: &mut App,
     ev: Event,
@@ -697,6 +720,19 @@ async fn handle_term_event(
                 q = q.replace('\r', " ");
                 search.push_str(q.trim_end(), app.prompt_history.entries(), &mut app.input);
             } else {
+                if let Some(vim) = app.vim.as_mut() {
+                    if vim.is_normal() {
+                        // Safety: never interpret a paste as Normal-mode commands.
+                        vim.cancel_pending();
+                        let _ = vim.handle_normal_key(VimKey::Char('i'), &mut app.input);
+                    }
+                    if vim.is_insert() {
+                        app.input.insert_str(&text);
+                        vim.on_insert_text(&text);
+                        return Ok(false);
+                    }
+                }
+
                 app.input.insert_str(&text);
             }
         }
@@ -708,6 +744,7 @@ async fn handle_term_event(
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let alt = key.modifiers.contains(KeyModifiers::ALT);
             let selecting = key.modifiers.contains(KeyModifiers::SHIFT);
+            let vim_normal = app.vim.as_ref().is_some_and(|v| v.is_normal());
 
             if ctrl {
                 if let KeyCode::Char('c') = key.code {
@@ -810,6 +847,9 @@ async fn handle_term_event(
 
                 if keep_search {
                     app.reverse_history_search = Some(search);
+                } else if let Some(vim) = app.vim.as_mut() {
+                    // Reverse-search sets the buffer programmatically; don't let dot-repeat track it.
+                    vim.reset_insert_tracking();
                 }
                 return Ok(false);
             }
@@ -826,19 +866,27 @@ async fn handle_term_event(
                         return Ok(false);
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
-                        app.input.move_to_start(selecting);
+                        if !vim_normal {
+                            app.input.move_to_start(selecting);
+                        }
                         return Ok(false);
                     }
                     KeyCode::Char('e') | KeyCode::Char('E') => {
-                        app.input.move_to_end(selecting);
+                        if !vim_normal {
+                            app.input.move_to_end(selecting);
+                        }
                         return Ok(false);
                     }
                     KeyCode::Left => {
-                        app.input.move_word_left(selecting);
+                        if !vim_normal {
+                            app.input.move_word_left(selecting);
+                        }
                         return Ok(false);
                     }
                     KeyCode::Right => {
-                        app.input.move_word_right(selecting);
+                        if !vim_normal {
+                            app.input.move_word_right(selecting);
+                        }
                         return Ok(false);
                     }
                     // Week 3: scrollback. Up/Down are history navigation, so use Ctrl+Up/Down.
@@ -863,12 +911,53 @@ async fn handle_term_event(
             }
 
             match key.code {
+                // Week 3: scrollback.
+                KeyCode::PageUp => {
+                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
+                    scroll_up(app, amount);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
+                    scroll_down(app, amount);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+
+            if let Some(vim) = app.vim.as_mut() {
+                if vim.is_normal() && !ctrl && !alt {
+                    if let Some(vk) = vim_key_from_code(key.code) {
+                        let res = vim.handle_normal_key(vk, &mut app.input);
+                        if matches!(res, VimHandleResult::Submit) {
+                            submit_prompt(app, engine.clone(), query_tx)?;
+                        }
+                    }
+                    return Ok(false);
+                }
+
+                if vim.is_insert() && matches!(key.code, KeyCode::Esc) {
+                    vim.enter_normal_mode(&mut app.input);
+                    return Ok(false);
+                }
+            }
+
+            // In Vim NORMAL mode, ignore non-vim modifiers instead of treating them as readline
+            // editing/history navigation.
+            if vim_normal {
+                return Ok(false);
+            }
+
+            match key.code {
                 // Week 6: command history.
                 KeyCode::Up => {
                     if alt {
                         app.input.move_up_line(selecting);
                     } else {
                         app.prompt_history.prev(&mut app.input);
+                        if let Some(vim) = app.vim.as_mut() {
+                            vim.reset_insert_tracking();
+                        }
                     }
                 }
                 KeyCode::Down => {
@@ -876,16 +965,10 @@ async fn handle_term_event(
                         app.input.move_down_line(selecting);
                     } else {
                         app.prompt_history.next(&mut app.input);
+                        if let Some(vim) = app.vim.as_mut() {
+                            vim.reset_insert_tracking();
+                        }
                     }
-                }
-                // Week 3: scrollback.
-                KeyCode::PageUp => {
-                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
-                    scroll_up(app, amount);
-                }
-                KeyCode::PageDown => {
-                    let amount = app.last_msg_view_height.saturating_sub(1).max(1);
-                    scroll_down(app, amount);
                 }
                 KeyCode::Home => {
                     app.input.move_to_start(selecting);
@@ -904,9 +987,15 @@ async fn handle_term_event(
                 }
                 KeyCode::Backspace => {
                     app.input.backspace();
+                    if let Some(vim) = app.vim.as_mut() {
+                        vim.on_insert_backspace();
+                    }
                 }
                 KeyCode::Delete => {
                     app.input.delete_forward();
+                    if let Some(vim) = app.vim.as_mut() {
+                        vim.on_insert_backspace();
+                    }
                 }
                 KeyCode::Left => {
                     if alt {
@@ -926,16 +1015,27 @@ async fn handle_term_event(
                 KeyCode::Enter => {
                     if alt {
                         app.input.insert_char('\n');
+                        if let Some(vim) = app.vim.as_mut() {
+                            vim.on_insert_text("\n");
+                        }
                     } else {
                         submit_prompt(app, engine.clone(), query_tx)?;
                     }
                 }
                 KeyCode::Tab => {
                     app.input.insert_char('\t');
+                    if let Some(vim) = app.vim.as_mut() {
+                        vim.on_insert_text("\t");
+                    }
                 }
                 KeyCode::Char(ch) => {
                     if !ctrl && !alt {
                         app.input.insert_char(ch);
+                        if let Some(vim) = app.vim.as_mut() {
+                            let mut buf = [0u8; 4];
+                            let s = ch.encode_utf8(&mut buf);
+                            vim.on_insert_text(s);
+                        }
                     }
                 }
                 _ => {}
@@ -964,6 +1064,9 @@ fn submit_prompt(
     app.prompt_history.reset_navigation();
     app.reverse_history_search = None;
     app.input.clear();
+    if let Some(vim) = app.vim.as_mut() {
+        vim.reset_insert_tracking();
+    }
     app.permission_prompt = None;
     app.tool_entry_for_id.clear();
     app.active_assistant_idx = None;
@@ -1284,12 +1387,17 @@ fn prepare_input_render(input: &InputBuffer, width: usize, max_lines: usize) -> 
 
 fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     let style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
+    let vim_label = app.vim.as_ref().map(|vim| match vim.mode() {
+        VimMode::Insert => "-- INSERT --",
+        VimMode::Normal => "-- NORMAL --",
+    });
 
     if let Some(search) = &app.reverse_history_search {
         let query = search.query();
         let preview = crate::one_line_preview(app.input.as_str(), 80);
+        let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
         let body = format!(
-            "{spin} reverse-i-search `{query}`: {preview} • Enter accept • Esc cancel • Ctrl+R older"
+            "{spin} {vim_prefix}reverse-i-search `{query}`: {preview} • Enter accept • Esc cancel • Ctrl+R older"
         );
         return Line::from(body).style(style);
     }
@@ -1301,11 +1409,16 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     };
     let input_hint = if app.in_flight {
         ""
+    } else if app.vim.as_ref().is_some_and(|vim| vim.is_normal()) {
+        " • Enter submit • i/a/I/A edit • o/O open line • . repeat"
+    } else if app.vim.is_some() {
+        " • Esc normal • Alt+Enter newline • Up/Down history • Ctrl+R search"
     } else {
         " • Alt+Enter newline • Up/Down history • Ctrl+R search"
     };
+    let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
 
-    Line::from(format!("{spin} {}{scroll_hint}{input_hint}", app.status)).style(style)
+    Line::from(format!("{spin} {vim_prefix}{}{scroll_hint}{input_hint}", app.status)).style(style)
 }
 
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {

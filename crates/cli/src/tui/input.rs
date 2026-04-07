@@ -24,6 +24,14 @@ impl InputBuffer {
         self.cursor
     }
 
+    pub fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     pub fn has_selection(&self) -> bool {
         self.selection_range().is_some()
     }
@@ -65,6 +73,11 @@ impl InputBuffer {
         self.selection_anchor = None;
     }
 
+    pub fn set_cursor(&mut self, cursor: usize) {
+        self.cursor = clamp_to_char_boundary(&self.text, cursor.min(self.text.len()));
+        self.selection_anchor = None;
+    }
+
     pub fn insert_str(&mut self, s: &str) {
         self.delete_selection();
         self.text.insert_str(self.cursor, s);
@@ -76,6 +89,18 @@ impl InputBuffer {
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         self.insert_str(s);
+    }
+
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        let start = clamp_to_char_boundary(&self.text, start.min(self.text.len()));
+        let end = clamp_to_char_boundary(&self.text, end.min(self.text.len()));
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        if start == end {
+            return;
+        }
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.selection_anchor = None;
     }
 
     pub fn backspace(&mut self) {
