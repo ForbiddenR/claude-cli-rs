@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Terminal;
 use similar::TextDiff;
 use tokio::sync::{mpsc, oneshot};
@@ -29,11 +29,15 @@ use tokio::sync::{mpsc, oneshot};
 use crate::args::{Args, InputFormat, OutputFormat};
 
 mod input;
+mod keymap;
 mod markdown;
+mod slash;
 mod vim;
 
 use input::{InputBuffer, PromptHistory, ReverseHistorySearch};
+use keymap::{KeyAction, KeyContext, KeySequence, KeybindingResolver, ResolveOutcome};
 use markdown::{MarkdownRenderer, StreamingMarkdown};
+use slash::{match_commands, parse_slash_command, SlashCommandDef, SLASH_COMMANDS};
 use vim::{VimHandleResult, VimKey, VimMachine, VimMode};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -69,6 +73,10 @@ struct App {
     prompt_history: PromptHistory,
     reverse_history_search: Option<ReverseHistorySearch>,
     vim: Option<VimMachine>,
+    keymap: KeybindingResolver,
+    typeahead_query: Option<String>,
+    typeahead_selected: usize,
+    typeahead_suppressed_text: Option<String>,
     status: String,
     spinner_idx: usize,
     in_flight: bool,
@@ -102,6 +110,26 @@ struct App {
     model: String,
     cwd: PathBuf,
     user_settings_path: PathBuf,
+
+    // Week 8: slash commands need access to the engine so commands can change model or compact.
+    client: claude_services::api::AnthropicClient,
+    auth: AuthMode,
+    engine_inputs: EngineInputs,
+    engine: std::sync::Arc<claude_query::QueryEngine>,
+
+    // Week 8: running totals for `/cost`.
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cost_usd: Option<f64>,
+    last_turn_input_tokens: u64,
+    last_turn_output_tokens: u64,
+    last_turn_cost_usd: Option<f64>,
+}
+
+#[derive(Clone)]
+struct EngineInputs {
+    max_tokens: u32,
+    cfg: claude_query::QueryEngineConfig,
 }
 
 #[derive(Debug)]
@@ -126,6 +154,12 @@ enum QueryEvent {
         reply_tx: oneshot::Sender<claude_query::PermissionDecision>,
     },
     Finished(claude_query::RunResult),
+    CompactionFinished {
+        session_id: SessionId,
+        session_path: PathBuf,
+        history: Vec<Message>,
+    },
+    CompactionError(String),
     Error(String),
 }
 
@@ -328,6 +362,209 @@ impl App {
         }
         cache.dirty = false;
     }
+
+    fn current_key_context(&self) -> KeyContext {
+        if self.typeahead_active() {
+            return KeyContext::CommandTypeahead;
+        }
+        if self.vim.as_ref().is_some_and(|vim| vim.is_normal()) {
+            return KeyContext::VimNormal;
+        }
+        if self.vim.is_some() {
+            return KeyContext::VimInsert;
+        }
+        KeyContext::Input
+    }
+
+    fn sync_typeahead(&mut self) {
+        if self.typeahead_suppressed_text.as_deref() != Some(self.input.as_str()) {
+            self.typeahead_suppressed_text = None;
+        }
+        if self.typeahead_suppressed_text.is_some() {
+            self.typeahead_query = None;
+            self.typeahead_selected = 0;
+            return;
+        }
+
+        let Some(query) = slash_query(&self.input) else {
+            self.typeahead_query = None;
+            self.typeahead_selected = 0;
+            return;
+        };
+
+        let suggestions = match_commands(&query);
+        if suggestions.is_empty() {
+            self.typeahead_query = None;
+            self.typeahead_selected = 0;
+            return;
+        }
+
+        let query_changed = self.typeahead_query.as_deref() != Some(query.as_str());
+        if query_changed {
+            self.typeahead_selected = 0;
+        } else {
+            self.typeahead_selected = self.typeahead_selected.min(suggestions.len().saturating_sub(1));
+        }
+        self.typeahead_query = Some(query);
+    }
+
+    fn typeahead_active(&self) -> bool {
+        self.typeahead_query.is_some()
+    }
+
+    fn typeahead_items(&self) -> Vec<&'static SlashCommandDef> {
+        match self.typeahead_query.as_deref() {
+            Some(query) => match_commands(query),
+            None => Vec::new(),
+        }
+    }
+
+    fn move_typeahead(&mut self, delta: isize) {
+        let suggestions = self.typeahead_items();
+        if suggestions.is_empty() {
+            self.typeahead_selected = 0;
+            return;
+        }
+        let len = suggestions.len() as isize;
+        let cur = self.typeahead_selected.min(suggestions.len().saturating_sub(1)) as isize;
+        let next = (cur + delta).rem_euclid(len) as usize;
+        self.typeahead_selected = next;
+    }
+
+    fn accept_typeahead(&mut self) -> bool {
+        let suggestions = self.typeahead_items();
+        let Some(selected) = suggestions.get(self.typeahead_selected.min(suggestions.len().saturating_sub(1))) else {
+            return false;
+        };
+
+        let current = self.input.as_str().trim();
+        let suffix = current
+            .strip_prefix('/')
+            .map(|rest| rest.split_once(char::is_whitespace).map(|(_, tail)| tail).unwrap_or(""))
+            .unwrap_or("");
+
+        let new_text = if suffix.trim().is_empty() {
+            format!("/{} ", selected.name)
+        } else {
+            format!("/{} {}", selected.name, suffix.trim_start())
+        };
+        self.input.set_text(new_text);
+        self.sync_typeahead();
+        true
+    }
+
+    fn dismiss_typeahead(&mut self) {
+        self.typeahead_suppressed_text = Some(self.input.as_str().to_string());
+        self.typeahead_query = None;
+        self.typeahead_selected = 0;
+    }
+
+    fn push_system_message(&mut self, text: impl Into<String>) {
+        self.transcript.push(ChatEntry {
+            role: Role::System,
+            text: text.into(),
+        });
+        self.rendered.push(RenderedEntry::new(Role::System));
+        scroll_to_bottom(self);
+    }
+
+    fn clear_chat(&mut self) -> anyhow::Result<()> {
+        let new_id = SessionId::new();
+        let new_path = claude_core::history::session_file_path(&self.cwd, new_id)?;
+        self.session_id = new_id;
+        self.session_path = new_path;
+        self.history.clear();
+        self.input.clear();
+        self.transcript.clear();
+        self.rendered.clear();
+        self.tool_entry_for_id.clear();
+        self.permission_prompt = None;
+        self.active_assistant_idx = None;
+        self.dismiss_typeahead();
+        self.scroll_top = 0;
+        self.scroll_follow = true;
+        self.push_system_message("Started a new session. Previous transcript remains on disk.");
+        self.status = "session cleared".to_string();
+        Ok(())
+    }
+
+    fn rebuild_engine(&mut self) -> anyhow::Result<()> {
+        self.engine = std::sync::Arc::new(claude_query::QueryEngine::new(
+            self.client.clone(),
+            self.auth.clone(),
+            self.model.clone(),
+            self.engine_inputs.max_tokens,
+            self.engine_inputs.cfg.clone(),
+        )?);
+        Ok(())
+    }
+
+    fn record_run_cost(&mut self, result: &claude_query::RunResult) {
+        self.last_turn_input_tokens = result.usage.input_tokens;
+        self.last_turn_output_tokens = result.usage.output_tokens;
+        self.last_turn_cost_usd = result.cost_usd;
+        self.total_input_tokens = self
+            .total_input_tokens
+            .saturating_add(result.usage.input_tokens as u64);
+        self.total_output_tokens = self
+            .total_output_tokens
+            .saturating_add(result.usage.output_tokens as u64);
+        self.total_cost_usd = match (self.total_cost_usd, result.cost_usd) {
+            (Some(acc), Some(cost)) => Some(acc + cost),
+            (None, _) | (_, None) => None,
+        };
+    }
+}
+
+fn slash_query(input: &InputBuffer) -> Option<String> {
+    let raw = input.as_str();
+    if raw.contains('\n') {
+        return None;
+    }
+    let trimmed = raw.trim_start();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return None;
+    };
+
+    // Only show typeahead while editing the command name (before any whitespace).
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+
+    Some(rest.to_ascii_lowercase())
+}
+
+fn slash_candidate_name(app: &App) -> Option<String> {
+    let input = app.input.as_str().trim();
+    let rest = input.strip_prefix('/')?;
+    let typed = rest.split_whitespace().next().unwrap_or_default().trim().to_ascii_lowercase();
+    if typed.is_empty() {
+        return None;
+    }
+    if SLASH_COMMANDS.iter().any(|cmd| cmd.name == typed) {
+        return Some(typed);
+    }
+
+    let suggestions = app.typeahead_items();
+    suggestions
+        .get(app.typeahead_selected.min(suggestions.len().saturating_sub(1)))
+        .map(|cmd| cmd.name.to_string())
+}
+
+fn slash_command_help() -> String {
+    let mut out = String::new();
+    out.push_str("Slash commands\n\n");
+    for cmd in SLASH_COMMANDS {
+        out.push_str(&format!("- `{}`: {} ({})\n", cmd.name, cmd.description, cmd.usage));
+    }
+    out.push_str("\nUseful shortcuts\n\n");
+    out.push_str("- `Ctrl+L`: start a new empty session\n");
+    out.push_str("- `Ctrl+X Ctrl+K`: compact the current chat\n");
+    out.push_str("- `Ctrl+X Ctrl+C`: exit\n");
+    out.push_str("- `Tab`: accept the selected slash command\n");
+    out.push_str("\nConfig\n\n");
+    out.push_str("- Override shortcuts via `tuiKeybindings` in settings JSON (user/project/local).\n");
+    out
 }
 
 fn role_header(role: Role) -> Line<'static> {
@@ -523,6 +760,57 @@ pub async fn run_tui(
     let prompt_history = PromptHistory::new(prompt_history_from_messages(&history));
     let vim = matches!(settings.editor_mode, Some(EditorMode::Vim)).then(VimMachine::new);
 
+    let mut keymap = KeybindingResolver::new(Duration::from_millis(900));
+    // Global defaults. These can be overridden via settings `tuiKeybindings`.
+    keymap.add_binding(
+        &[KeyContext::Global],
+        KeySequence::parse("ctrl+l")?,
+        KeyAction::ClearChat,
+    );
+    // Week 8 deliverable: chord detection.
+    keymap.add_binding(
+        &[KeyContext::Global],
+        KeySequence::parse("ctrl+x ctrl+k")?,
+        KeyAction::CompactChat,
+    );
+    keymap.add_binding(
+        &[KeyContext::Global],
+        KeySequence::parse("ctrl+x ctrl+c")?,
+        KeyAction::Quit,
+    );
+    // Slash command typeahead navigation.
+    keymap.add_binding(
+        &[KeyContext::CommandTypeahead],
+        KeySequence::parse("up")?,
+        KeyAction::TypeaheadPrev,
+    );
+    keymap.add_binding(
+        &[KeyContext::CommandTypeahead],
+        KeySequence::parse("down")?,
+        KeyAction::TypeaheadNext,
+    );
+    keymap.add_binding(
+        &[KeyContext::CommandTypeahead],
+        KeySequence::parse("tab")?,
+        KeyAction::TypeaheadAccept,
+    );
+    keymap.add_binding(
+        &[KeyContext::CommandTypeahead],
+        KeySequence::parse("enter")?,
+        KeyAction::TypeaheadExecute,
+    );
+    keymap.add_binding(
+        &[KeyContext::CommandTypeahead],
+        KeySequence::parse("esc")?,
+        KeyAction::TypeaheadDismiss,
+    );
+
+    let keymap_warnings = settings
+        .tui_keybindings
+        .as_ref()
+        .map(|m| keymap.apply_user_overrides(m))
+        .unwrap_or_default();
+
     let mut transcript = transcript_from_history(&history);
     if transcript.is_empty() {
         transcript.push(ChatEntry {
@@ -530,13 +818,36 @@ pub async fn run_tui(
             text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
         });
     }
+    if !keymap_warnings.is_empty() {
+        transcript.push(ChatEntry {
+            role: Role::System,
+            text: format!(
+                "warn: some tuiKeybindings entries were ignored:\n- {}",
+                keymap_warnings.join("\n- ")
+            ),
+        });
+    }
     let rendered = transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
+
+    let client = claude_services::api::AnthropicClient::new(None);
+    let engine_inputs = compute_engine_inputs(args, settings)?;
+    let engine = std::sync::Arc::new(claude_query::QueryEngine::new(
+        client.clone(),
+        auth.clone(),
+        model.clone(),
+        engine_inputs.max_tokens,
+        engine_inputs.cfg.clone(),
+    )?);
 
     let mut app = App {
         input: InputBuffer::new(),
         prompt_history,
         reverse_history_search: None,
         vim,
+        keymap,
+        typeahead_query: None,
+        typeahead_selected: 0,
+        typeahead_suppressed_text: None,
         status: "ready".to_string(),
         spinner_idx: 0,
         in_flight: false,
@@ -558,11 +869,17 @@ pub async fn run_tui(
         model: model.clone(),
         cwd,
         user_settings_path,
+        client,
+        auth,
+        engine_inputs,
+        engine,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cost_usd: Some(0.0),
+        last_turn_input_tokens: 0,
+        last_turn_output_tokens: 0,
+        last_turn_cost_usd: None,
     };
-
-    let client = claude_services::api::AnthropicClient::new(None);
-    let engine = build_engine(args, settings, client, auth, model).await?;
-
     let (query_tx, mut query_rx) = mpsc::unbounded_channel::<QueryEvent>();
 
     let mut events = EventStream::new();
@@ -578,7 +895,7 @@ pub async fn run_tui(
             maybe_ev = events.next() => {
                 let Some(ev) = maybe_ev else { continue; };
                 let ev = ev.context("read terminal event")?;
-                if handle_term_event(&mut app, ev, &engine, query_tx.clone()).await? {
+                if handle_term_event(&mut app, ev, query_tx.clone()).await? {
                     break;
                 }
             }
@@ -598,13 +915,10 @@ pub async fn run_tui(
     Ok(())
 }
 
-async fn build_engine(
+fn compute_engine_inputs(
     args: &Args,
     settings: &claude_core::config::settings::Settings,
-    client: claude_services::api::AnthropicClient,
-    auth: AuthMode,
-    model: String,
-) -> anyhow::Result<std::sync::Arc<claude_query::QueryEngine>> {
+ ) -> anyhow::Result<EngineInputs> {
     let max_tokens = args.max_tokens.unwrap_or(1024);
     let max_turns = args.max_turns.unwrap_or(8);
 
@@ -634,12 +948,9 @@ async fn build_engine(
 
     let mcp_servers = crate::resolve_mcp_servers(args, settings)?;
 
-    let engine = claude_query::QueryEngine::new(
-        client,
-        auth,
-        model,
+    Ok(EngineInputs {
         max_tokens,
-        claude_query::QueryEngineConfig {
+        cfg: claude_query::QueryEngineConfig {
             cwd,
             bare: args.bare,
             add_dirs: args.add_dir.clone(),
@@ -657,9 +968,7 @@ async fn build_engine(
             agent_depth: 0,
             max_agent_depth: 2,
         },
-    )?;
-
-    Ok(std::sync::Arc::new(engine))
+    })
 }
 
 fn scroll_up(app: &mut App, amount: usize) {
@@ -706,7 +1015,6 @@ fn vim_key_from_code(code: KeyCode) -> Option<VimKey> {
 async fn handle_term_event(
     app: &mut App,
     ev: Event,
-    engine: &std::sync::Arc<claude_query::QueryEngine>,
     query_tx: mpsc::UnboundedSender<QueryEvent>,
 ) -> anyhow::Result<bool> {
     match ev {
@@ -854,6 +1162,25 @@ async fn handle_term_event(
                 return Ok(false);
             }
 
+            app.sync_typeahead();
+            let ctx = app.current_key_context();
+            match app.keymap.resolve(ctx, key) {
+                ResolveOutcome::Matched(action) => {
+                    if handle_key_action(app, action, query_tx.clone()).await? {
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+                ResolveOutcome::PendingChord => {
+                    // Keep the previous status (thinking, running tools, etc.) but add a hint.
+                    if !app.status.contains("chord") {
+                        app.status = format!("{} • chord…", app.status);
+                    }
+                    return Ok(false);
+                }
+                ResolveOutcome::NoMatch => {}
+            }
+
             if ctrl {
                 match key.code {
                     KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -930,7 +1257,9 @@ async fn handle_term_event(
                     if let Some(vk) = vim_key_from_code(key.code) {
                         let res = vim.handle_normal_key(vk, &mut app.input);
                         if matches!(res, VimHandleResult::Submit) {
-                            submit_prompt(app, engine.clone(), query_tx)?;
+                            if handle_submit(app, query_tx.clone()).await? {
+                                return Ok(true);
+                            }
                         }
                     }
                     return Ok(false);
@@ -1019,7 +1348,9 @@ async fn handle_term_event(
                             vim.on_insert_text("\n");
                         }
                     } else {
-                        submit_prompt(app, engine.clone(), query_tx)?;
+                        if handle_submit(app, query_tx.clone()).await? {
+                            return Ok(true);
+                        }
                     }
                 }
                 KeyCode::Tab => {
@@ -1046,9 +1377,212 @@ async fn handle_term_event(
     }
     Ok(false)
 }
+
+async fn handle_submit(
+    app: &mut App,
+    query_tx: mpsc::UnboundedSender<QueryEvent>,
+) -> anyhow::Result<bool> {
+    if app.in_flight {
+        return Ok(false);
+    }
+
+    app.sync_typeahead();
+    let raw = app.input.as_str().to_string();
+    let trimmed = raw.trim();
+
+    if trimmed.starts_with('/') {
+        if let Some(parsed) = parse_slash_command(trimmed) {
+            if SLASH_COMMANDS.iter().any(|c| c.name == parsed.name) {
+                app.input.clear();
+                app.dismiss_typeahead();
+                return execute_slash_command(app, &parsed.name, &parsed.args, query_tx).await;
+            }
+        }
+
+        // If the user is typing a partial slash command and typeahead is open,
+        // Enter should execute the selected suggestion.
+        if app.typeahead_active() {
+            if let Some(name) = slash_candidate_name(app) {
+                app.input.clear();
+                app.dismiss_typeahead();
+                return execute_slash_command(app, &name, &[], query_tx).await;
+            }
+        }
+    }
+
+    submit_prompt(app, query_tx)?;
+    Ok(false)
+}
+
+async fn handle_key_action(
+    app: &mut App,
+    action: KeyAction,
+    query_tx: mpsc::UnboundedSender<QueryEvent>,
+) -> anyhow::Result<bool> {
+    match action {
+        KeyAction::Quit => return Ok(true),
+        KeyAction::ClearChat => {
+            if app.in_flight {
+                app.status = "busy; wait for the current run to finish".to_string();
+            } else {
+                app.clear_chat()?;
+            }
+        }
+        KeyAction::CompactChat => {
+            if app.in_flight {
+                app.status = "busy; wait for the current run to finish".to_string();
+            } else {
+                return execute_slash_command(app, "compact", &[], query_tx).await;
+            }
+        }
+        KeyAction::ShowHelp => {
+            app.push_system_message(slash_command_help());
+            app.status = "help".to_string();
+        }
+        KeyAction::ShowCost => {
+            return execute_slash_command(app, "cost", &[], query_tx).await;
+        }
+        KeyAction::TypeaheadNext => {
+            app.move_typeahead(1);
+            app.status = "slash command".to_string();
+        }
+        KeyAction::TypeaheadPrev => {
+            app.move_typeahead(-1);
+            app.status = "slash command".to_string();
+        }
+        KeyAction::TypeaheadAccept => {
+            if app.accept_typeahead() {
+                app.status = "slash command".to_string();
+            }
+        }
+        KeyAction::TypeaheadExecute => {
+            return handle_submit(app, query_tx).await;
+        }
+        KeyAction::TypeaheadDismiss => {
+            app.dismiss_typeahead();
+            app.status = "ready".to_string();
+        }
+    }
+
+    Ok(false)
+}
+
+async fn execute_slash_command(
+    app: &mut App,
+    name: &str,
+    args: &[String],
+    query_tx: mpsc::UnboundedSender<QueryEvent>,
+) -> anyhow::Result<bool> {
+    let cmd = name.trim().to_ascii_lowercase();
+    match cmd.as_str() {
+        "help" => {
+            app.push_system_message(slash_command_help());
+            app.status = "help".to_string();
+        }
+        "model" => {
+            if args.is_empty() {
+                app.push_system_message(format!("Current model: `{}`", app.model));
+                app.status = format!("model {}", app.model);
+            } else {
+                let next = args.join(" ").trim().to_string();
+                if next.is_empty() {
+                    app.push_system_message("usage: /model [model-id]");
+                } else if app.in_flight {
+                    app.status = "cannot change model while a run is active".to_string();
+                } else {
+                    app.model = next.clone();
+                    app.rebuild_engine()?;
+                    app.push_system_message(format!("Model updated to `{next}`"));
+                    app.status = format!("model {}", app.model);
+                }
+            }
+        }
+        "clear" => {
+            if app.in_flight {
+                app.status = "cannot clear while a run is active".to_string();
+            } else {
+                app.clear_chat()?;
+            }
+        }
+        "compact" => {
+            if app.in_flight {
+                app.status = "cannot compact while a run is active".to_string();
+            } else if app.history.len() < 4 {
+                app.push_system_message("Not enough history to compact yet.");
+                app.status = "compact skipped".to_string();
+            } else {
+                app.in_flight = true;
+                app.spinner_idx = 0;
+                app.status = "compacting history...".to_string();
+
+                let engine = app.engine.clone();
+                let history = app.history.clone();
+                let cwd = app.cwd.clone();
+                tokio::spawn(async move {
+                    match engine.compact_history_now(history).await {
+                        Ok(compacted) => {
+                            let session_id = SessionId::new();
+                            let session_path = match claude_core::history::session_file_path(&cwd, session_id) {
+                                Ok(path) => path,
+                                Err(err) => {
+                                    let _ = query_tx.send(QueryEvent::CompactionError(err.to_string()));
+                                    return;
+                                }
+                            };
+
+                            // Best-effort persistence so `--continue/--resume` sees the compacted context.
+                            let _ = claude_core::history::append_session_messages(&session_path, &compacted);
+
+                            let _ = query_tx.send(QueryEvent::CompactionFinished {
+                                session_id,
+                                session_path,
+                                history: compacted,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = query_tx.send(QueryEvent::CompactionError(err.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        "cost" => {
+            let body = match app.total_cost_usd {
+                Some(total) => format!(
+                    "Session usage\n\n- total input tokens: {}\n- total output tokens: {}\n- total cost: ${:.4}\n- last turn input tokens: {}\n- last turn output tokens: {}\n{}",
+                    app.total_input_tokens,
+                    app.total_output_tokens,
+                    total,
+                    app.last_turn_input_tokens,
+                    app.last_turn_output_tokens,
+                    app.last_turn_cost_usd
+                        .map(|v| format!("- last turn cost: ${v:.4}"))
+                        .unwrap_or_else(|| "- last turn cost: unavailable".to_string()),
+                ),
+                None => format!(
+                    "Session usage\n\n- total input tokens: {}\n- total output tokens: {}\n- total cost: unavailable\n- last turn input tokens: {}\n- last turn output tokens: {}\n- last turn cost: unavailable",
+                    app.total_input_tokens,
+                    app.total_output_tokens,
+                    app.last_turn_input_tokens,
+                    app.last_turn_output_tokens,
+                ),
+            };
+            app.push_system_message(body);
+            app.status = "cost".to_string();
+        }
+        "exit" => return Ok(true),
+        other => {
+            let known = SLASH_COMMANDS.iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
+            app.push_system_message(format!("Unknown slash command `{other}`. Available: {known}"));
+            app.status = format!("unknown command `{other}`");
+        }
+    }
+
+    Ok(false)
+}
+
 fn submit_prompt(
     app: &mut App,
-    engine: std::sync::Arc<claude_query::QueryEngine>,
     query_tx: mpsc::UnboundedSender<QueryEvent>,
 ) -> anyhow::Result<()> {
     if app.in_flight {
@@ -1097,6 +1631,7 @@ fn submit_prompt(
     let session_path = app.session_path.clone();
     let session_id = app.session_id;
     let always_allow_tools = app.always_allow_tools.clone();
+    let engine = app.engine.clone();
 
     tokio::spawn(async move {
         let tx_for_deltas = query_tx.clone();
@@ -1216,6 +1751,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.in_flight = false;
             app.active_assistant_idx = None;
             app.permission_prompt = None;
+            app.record_run_cost(&result);
             app.history = result.history;
             if let Some(idx) = finished_idx {
                 app.finalize_streaming(idx);
@@ -1231,6 +1767,40 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                     result.usage.input_tokens, result.usage.output_tokens
                 ),
             };
+        }
+        QueryEvent::CompactionFinished {
+            session_id,
+            session_path,
+            history,
+        } => {
+            app.in_flight = false;
+            app.active_assistant_idx = None;
+            app.permission_prompt = None;
+            app.tool_entry_for_id.clear();
+
+            app.session_id = session_id;
+            app.session_path = session_path;
+            app.history = history;
+
+            app.transcript = transcript_from_history(&app.history);
+            if app.transcript.is_empty() {
+                app.transcript.push(ChatEntry {
+                    role: Role::System,
+                    text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
+                });
+            }
+            app.rendered = app.transcript.iter().map(|e| RenderedEntry::new(e.role)).collect();
+            app.render_width = 0;
+            app.scroll_top = 0;
+            app.scroll_follow = true;
+
+            app.push_system_message(format!("Compaction complete • new session {}", app.session_id));
+            app.status = "compaction done".to_string();
+        }
+        QueryEvent::CompactionError(err) => {
+            app.in_flight = false;
+            app.status = format!("compact failed: {}", crate::one_line_preview(&err, 160));
+            app.push_system_message(format!("error: compaction failed: {err}"));
         }
         QueryEvent::Error(err) => {
             app.in_flight = false;
@@ -1402,6 +1972,14 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
         return Line::from(body).style(style);
     }
 
+    if let Some(query) = app.typeahead_query.as_deref() {
+        let vim_prefix = vim_label.map(|mode| format!("{mode} • ")).unwrap_or_default();
+        let body = format!(
+            "{spin} {vim_prefix}slash command `/{query}` • Up/Down select • Tab complete • Enter run • Esc clear"
+        );
+        return Line::from(body).style(style);
+    }
+
     let scroll_hint = if app.scroll_follow {
         ""
     } else {
@@ -1422,11 +2000,30 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
 }
 
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
+    app.sync_typeahead();
     let size = f.size();
     let max_input_lines = size.height.saturating_sub(5).max(1) as usize;
     let max_input_lines = max_input_lines.min(MAX_INPUT_VISIBLE_LINES);
-    let estimated_input = prepare_input_render(&app.input, size.width.saturating_sub(2) as usize, max_input_lines);
-    let input_height = estimated_input.visible_line_count.max(1) as u16 + 2;
+
+    let mut typeahead = if app.typeahead_active() {
+        app.typeahead_items()
+    } else {
+        Vec::new()
+    };
+    typeahead.truncate(6);
+    // Inside the input box: a single separator line + N commands.
+    let typeahead_height = if typeahead.is_empty() {
+        0
+    } else {
+        typeahead.len() as u16 + 1
+    };
+
+    let estimated_input = prepare_input_render(
+        &app.input,
+        size.width.saturating_sub(2) as usize,
+        max_input_lines,
+    );
+    let input_height = estimated_input.visible_line_count.max(1) as u16 + 2 + typeahead_height;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1472,21 +2069,83 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     }
     render_transcript(f, app, inner, app.scroll_top);
 
-    // Input
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title("Input • Alt+Enter newline • Up/Down history");
+    // Input (+ Week 8: slash command typeahead inside the input box).
+    let input_title = if app.in_flight {
+        "Input • / for commands • Alt+Enter newline"
+    } else {
+        "Input • / for commands • Alt+Enter newline • Up/Down history"
+    };
+    let input_block = Block::default().borders(Borders::ALL).title(input_title);
     let input_inner = input_block.inner(chunks[2]);
+
+    let typeahead_area_height = typeahead_height.min(input_inner.height.saturating_sub(1));
+    let (input_area, typeahead_area) = if typeahead_area_height >= 2 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(typeahead_area_height)])
+            .split(input_inner);
+        (split[0], split[1])
+    } else {
+        (
+            input_inner,
+            ratatui::layout::Rect {
+                x: input_inner.x,
+                y: input_inner.y.saturating_add(input_inner.height),
+                width: input_inner.width,
+                height: 0,
+            },
+        )
+    };
+
     let input_layout = prepare_input_render(
         &app.input,
-        input_inner.width.max(1) as usize,
-        input_inner.height.max(1) as usize,
+        input_area.width.max(1) as usize,
+        input_area.height.max(1) as usize,
     );
-    let input = Paragraph::new(input_layout.text.clone()).block(input_block);
-    f.render_widget(input, chunks[2]);
+    f.render_widget(&input_block, chunks[2]);
+    f.render_widget(Paragraph::new(input_layout.text.clone()), input_area);
 
-    let cursor_x = chunks[2].x + 1 + input_layout.cursor_col as u16;
-    let cursor_y = chunks[2].y + 1 + input_layout.cursor_row as u16;
+    if typeahead_area.height > 0 && !typeahead.is_empty() {
+        f.render_widget(ratatui::widgets::Clear, typeahead_area);
+
+        // A top border line to visually separate suggestions from input text.
+        let list_block = Block::default()
+            .borders(Borders::TOP)
+            .title("Commands");
+        let list_inner = list_block.inner(typeahead_area);
+        f.render_widget(&list_block, typeahead_area);
+
+        let available = list_inner.height as usize;
+        let visible = available.min(typeahead.len());
+
+        let items: Vec<ListItem<'static>> = typeahead
+            .iter()
+            .take(visible)
+            .enumerate()
+            .map(|(idx, cmd)| {
+                let mut item = ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("/{}", cmd.name),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(cmd.description, Style::default().fg(Color::Gray)),
+                ]));
+                if idx == app.typeahead_selected {
+                    item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+                }
+                item
+            })
+            .collect();
+
+        let list = List::new(items);
+        f.render_widget(list, list_inner);
+    }
+
+    let cursor_x = input_area.x + input_layout.cursor_col as u16;
+    let cursor_y = input_area.y + input_layout.cursor_row as u16;
     if app.permission_prompt.is_none() {
         f.set_cursor(cursor_x, cursor_y);
     }

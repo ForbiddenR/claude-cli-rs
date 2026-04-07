@@ -183,6 +183,16 @@ impl QueryEngine {
             .await
     }
 
+    pub async fn compact_history_now(&self, history: Vec<Message>) -> anyhow::Result<Vec<Message>> {
+        compact_history(
+            self,
+            &history,
+            COMPACT_KEEP_TAIL_MESSAGES,
+            COMPACT_SUMMARY_MAX_TOKENS,
+        )
+        .await
+    }
+
     async fn run_with_history_inner<F>(
         &self,
         mut history: Vec<Message>,

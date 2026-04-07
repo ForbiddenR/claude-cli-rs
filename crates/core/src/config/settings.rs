@@ -92,6 +92,16 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub editor_mode: Option<EditorMode>,
+
+    /// Global TUI keybinding overrides. Keys are action names, values are key
+    /// sequences like `ctrl+x ctrl+k` or `tab`.
+    #[serde(
+        default,
+        rename = "tuiKeybindings",
+        alias = "tui_keybindings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tui_keybindings: Option<HashMap<String, String>>,
 }
 
 impl Settings {
@@ -107,6 +117,8 @@ impl Settings {
         let mut merged_always_allow: Vec<String> = Vec::new();
         let mut saw_always_allow = false;
         let mut always_allow_seen: HashSet<String> = HashSet::new();
+        let mut merged_tui_keybindings: HashMap<String, String> = HashMap::new();
+        let mut saw_tui_keybindings = false;
 
         for layer in layers {
             if layer.model.is_some() {
@@ -143,6 +155,12 @@ impl Settings {
             if layer.editor_mode.is_some() {
                 out.editor_mode = layer.editor_mode;
             }
+            if let Some(map) = &layer.tui_keybindings {
+                saw_tui_keybindings = true;
+                for (k, v) in map {
+                    merged_tui_keybindings.insert(k.clone(), v.clone());
+                }
+            }
 
             if let Some(env) = &layer.env {
                 saw_env = true;
@@ -169,6 +187,10 @@ impl Settings {
 
         if saw_always_allow {
             out.always_allow_tools = Some(merged_always_allow);
+        }
+
+        if saw_tui_keybindings {
+            out.tui_keybindings = Some(merged_tui_keybindings);
         }
 
         out
