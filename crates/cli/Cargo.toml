@@ -16,6 +16,7 @@ chrono.workspace = true
 claude-core = { path = "../core" }
 claude-query = { path = "../query" }
 claude-services = { path = "../services" }
+dirs.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
@@ -23,6 +24,7 @@ crossterm.workspace = true
 futures-util.workspace = true
 pulldown-cmark.workspace = true
 syntect.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"

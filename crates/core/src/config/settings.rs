@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -20,6 +20,18 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub permission_mode: Option<PermissionMode>,
+
+    /// Tools that should be auto-approved in `permissionMode=default`.
+    ///
+    /// This does not affect which tools are exposed to the model; it only
+    /// bypasses the interactive permission prompt for those tool names.
+    #[serde(
+        default,
+        rename = "alwaysAllowTools",
+        alias = "always_allow_tools",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub always_allow_tools: Option<Vec<String>>,
 
     #[serde(
         default,
@@ -75,6 +87,9 @@ impl Settings {
         let mut saw_env = false;
         let mut merged_mcp: HashMap<String, McpServerConfig> = HashMap::new();
         let mut saw_mcp = false;
+        let mut merged_always_allow: Vec<String> = Vec::new();
+        let mut saw_always_allow = false;
+        let mut always_allow_seen: HashSet<String> = HashSet::new();
 
         for layer in layers {
             if layer.model.is_some() {
@@ -82,6 +97,19 @@ impl Settings {
             }
             if layer.permission_mode.is_some() {
                 out.permission_mode = layer.permission_mode;
+            }
+            if let Some(list) = &layer.always_allow_tools {
+                saw_always_allow = true;
+                for t in list {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let key = t.to_ascii_lowercase();
+                    if always_allow_seen.insert(key) {
+                        merged_always_allow.push(t.to_string());
+                    }
+                }
             }
             if layer.api_key_helper.is_some() {
                 out.api_key_helper = layer.api_key_helper.clone();
@@ -117,6 +145,10 @@ impl Settings {
 
         if saw_mcp {
             out.mcp_servers = Some(merged_mcp);
+        }
+
+        if saw_always_allow {
+            out.always_allow_tools = Some(merged_always_allow);
         }
 
         out

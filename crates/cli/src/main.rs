@@ -327,6 +327,8 @@ async fn run_headless(
     let mut disallowed_tools = settings.disallowed_tools.clone().unwrap_or_default();
     disallowed_tools.extend(args.disallowed_tools.clone());
 
+    let always_allow_tools = settings.always_allow_tools.clone().unwrap_or_default();
+
     let mcp_servers = resolve_mcp_servers(args, settings)?;
 
     let engine = claude_query::QueryEngine::new(
@@ -347,6 +349,7 @@ async fn run_headless(
             base_tools: args.tools.clone(),
             allowed_tools,
             disallowed_tools,
+            always_allow_tools,
             mcp_servers,
             agent_depth: 0,
             max_agent_depth: 2,

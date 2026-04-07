@@ -88,6 +88,10 @@ pub struct QueryEngineConfig {
     pub base_tools: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+    /// Tools that should be auto-approved in `permissionMode=default`.
+    ///
+    /// Stored and matched case-insensitively.
+    pub always_allow_tools: Vec<String>,
 
     // Week 5: MCP servers
     pub mcp_servers: HashMap<String, McpServerConfig>,
@@ -268,7 +272,15 @@ impl QueryEngine {
         };
 
         let mut did_reactive_compact: bool = false;
-        let mut always_allow_tools: HashSet<String> = HashSet::new();
+        let always_allow_seed: HashSet<String> = self
+            .cfg
+            .always_allow_tools
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut always_allow_tools: HashSet<String> = always_allow_seed.clone();
 
         loop {
             turns += 1;
@@ -416,8 +428,9 @@ impl QueryEngine {
                     for call in tool_calls {
                         let tools = tools.clone();
                         let mut ctx = tool_ctx.clone();
+                        let always_allow_seed = always_allow_seed.clone();
                         handles.push(tokio::spawn(async move {
-                            let mut always_allow_tools: HashSet<String> = HashSet::new();
+                            let mut always_allow_tools: HashSet<String> = always_allow_seed;
                             execute_tool_call(&tools, &mut ctx, call, None, &mut always_allow_tools)
                                 .await
                         }));
@@ -541,10 +554,12 @@ async fn execute_tool_call(
         };
     }
 
-    // If the tool was previously always-allowed (within this run), temporarily
-    // lift the permission-mode gate.
+    // If the tool was previously always-allowed (within this run or via config),
+    // temporarily lift the permission-mode gate.
     let mut permission_override: Option<PermissionMode> = None;
-    let bypass_prompt = ctx.permission_mode == PermissionMode::Default && always_allow_tools.contains(&name);
+    let name_key = name.trim().to_ascii_lowercase();
+    let bypass_prompt =
+        ctx.permission_mode == PermissionMode::Default && always_allow_tools.contains(&name_key);
     if bypass_prompt {
         permission_override = Some(PermissionMode::AcceptEdits);
     }
@@ -583,7 +598,7 @@ async fn execute_tool_call(
                     permission_override = Some(PermissionMode::AcceptEdits);
                 }
                 PermissionDecision::AlwaysAllowTool => {
-                    always_allow_tools.insert(name.clone());
+                    always_allow_tools.insert(name_key);
                     permission_override = Some(PermissionMode::AcceptEdits);
                 }
             }

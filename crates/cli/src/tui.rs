@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -16,8 +17,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use similar::TextDiff;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::args::{Args, InputFormat, OutputFormat};
@@ -69,6 +71,8 @@ struct App {
     // Week 4: tools + permissions
     tool_entry_for_id: HashMap<String, usize>,
     permission_prompt: Option<PermissionPrompt>,
+    /// Lowercased tool names that are auto-approved in Default permission mode.
+    always_allow_tools: Arc<Mutex<HashSet<String>>>,
 
     // Week 3: scrollback + virtualization
     /// Start line (0-based) of the transcript viewport.
@@ -84,6 +88,8 @@ struct App {
     session_id: SessionId,
     session_path: PathBuf,
     model: String,
+    cwd: PathBuf,
+    user_settings_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -114,13 +120,14 @@ enum QueryEvent {
 struct PermissionPrompt {
     id: String,
     tool_name: String,
-    input: serde_json::Value,
+    details: String,
     reply_tx: oneshot::Sender<claude_query::PermissionDecision>,
 }
 
 #[derive(Clone)]
 struct TuiObserver {
     tx: mpsc::UnboundedSender<QueryEvent>,
+    always_allow_tools: Arc<Mutex<HashSet<String>>>,
 }
 
 #[async_trait]
@@ -156,6 +163,13 @@ impl claude_query::QueryObserver for TuiObserver {
         name: &str,
         input: &serde_json::Value,
     ) -> claude_query::PermissionDecision {
+        let key = name.trim().to_ascii_lowercase();
+        if let Ok(set) = self.always_allow_tools.lock() {
+            if set.contains(&key) {
+                return claude_query::PermissionDecision::AlwaysAllowTool;
+            }
+        }
+
         let (reply_tx, reply_rx) = oneshot::channel();
         let _ = self.tx.send(QueryEvent::PermissionRequest {
             id: id.to_string(),
@@ -473,9 +487,23 @@ pub async fn run_tui(
     terminal.clear().ok();
 
     let cwd = std::env::current_dir()?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     let (session_id, session_path, history) = crate::resolve_session(args, &cwd)?;
 
     let model = crate::resolve_model(args.model.clone(), settings.model.clone());
+
+    let config_home = claude_core::paths::claude_config_home_dir()?;
+    let user_settings_path = config_home.join("settings.json");
+    let always_allow_tools = Arc::new(Mutex::new(
+        settings
+            .always_allow_tools
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect::<HashSet<_>>(),
+    ));
 
     let md = MarkdownRenderer::new();
 
@@ -501,6 +529,7 @@ pub async fn run_tui(
         history,
         tool_entry_for_id: HashMap::new(),
         permission_prompt: None,
+        always_allow_tools,
         scroll_top: 0,
         scroll_follow: true,
         last_msg_view_height: 0,
@@ -508,6 +537,8 @@ pub async fn run_tui(
         session_id,
         session_path,
         model: model.clone(),
+        cwd,
+        user_settings_path,
     };
 
     let client = claude_services::api::AnthropicClient::new(None);
@@ -574,6 +605,8 @@ async fn build_engine(
     let mut disallowed_tools = settings.disallowed_tools.clone().unwrap_or_default();
     disallowed_tools.extend(args.disallowed_tools.clone());
 
+    let always_allow_tools = settings.always_allow_tools.clone().unwrap_or_default();
+
     // Week 1: AskUserQuestion reads stdin and will break raw-mode TUI. Later
     // weeks implement a proper in-TUI prompt for tool questions.
     if !disallowed_tools.iter().any(|t| t == "AskUserQuestion") {
@@ -600,6 +633,7 @@ async fn build_engine(
             base_tools: args.tools.clone(),
             allowed_tools,
             disallowed_tools,
+            always_allow_tools,
             mcp_servers,
             agent_depth: 0,
             max_agent_depth: 2,
@@ -668,16 +702,46 @@ async fn handle_term_event(
 
                 if let Some(decision) = decision {
                     if let Some(prompt) = app.permission_prompt.take() {
+                        if matches!(decision, claude_query::PermissionDecision::AlwaysAllowTool) {
+                            // Update in-memory allowlist so future prompts in this TUI session can
+                            // auto-approve without requiring a restart.
+                            if let Ok(mut set) = app.always_allow_tools.lock() {
+                                set.insert(prompt.tool_name.trim().to_ascii_lowercase());
+                            }
+
+                            let saved = persist_always_allow_tool(
+                                &app.user_settings_path,
+                                &prompt.tool_name,
+                            );
+
+                            match saved {
+                                Ok(true) => {
+                                    app.status = format!("always allow {} (saved)", prompt.tool_name)
+                                }
+                                Ok(false) => {
+                                    app.status =
+                                        format!("always allow {} (already saved)", prompt.tool_name)
+                                }
+                                Err(err) => {
+                                    app.status = format!(
+                                        "always allow {} (save failed: {})",
+                                        prompt.tool_name,
+                                        crate::one_line_preview(&err.to_string(), 120)
+                                    )
+                                }
+                            }
+                        }
+
                         let _ = prompt.reply_tx.send(decision);
-                        match decision {
-                            claude_query::PermissionDecision::AllowOnce => {
-                                app.status = format!("allowed {}", prompt.tool_name)
-                            }
-                            claude_query::PermissionDecision::AlwaysAllowTool => {
-                                app.status = format!("always allow {}", prompt.tool_name)
-                            }
-                            claude_query::PermissionDecision::Deny => {
-                                app.status = format!("denied {}", prompt.tool_name)
+                        if !matches!(decision, claude_query::PermissionDecision::AlwaysAllowTool) {
+                            match decision {
+                                claude_query::PermissionDecision::AllowOnce => {
+                                    app.status = format!("allowed {}", prompt.tool_name)
+                                }
+                                claude_query::PermissionDecision::Deny => {
+                                    app.status = format!("denied {}", prompt.tool_name)
+                                }
+                                claude_query::PermissionDecision::AlwaysAllowTool => {}
                             }
                         }
                     }
@@ -773,11 +837,12 @@ fn submit_prompt(
     let history_for_engine = app.history.clone();
     let session_path = app.session_path.clone();
     let session_id = app.session_id;
+    let always_allow_tools = app.always_allow_tools.clone();
 
     tokio::spawn(async move {
         let tx_for_deltas = query_tx.clone();
         let observer: std::sync::Arc<dyn claude_query::QueryObserver> =
-            std::sync::Arc::new(TuiObserver { tx: query_tx.clone() });
+            std::sync::Arc::new(TuiObserver { tx: query_tx.clone(), always_allow_tools });
 
         let res = engine
             .run_with_history_observed(history_for_engine, |event| {
@@ -838,13 +903,15 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             if let Some(idx) = app.active_assistant_idx.take() {
                 app.finalize_streaming(idx);
             }
+            let activity = tool_activity_status(&name, &input);
+            let details = permission_details(&app.cwd, &name, &input);
             app.permission_prompt = Some(PermissionPrompt {
                 id,
                 tool_name: name,
-                input,
+                details,
                 reply_tx,
             });
-            app.status = "permission required".to_string();
+            app.status = format!("permission required • {activity}");
         }
         QueryEvent::ToolUseStart { id, name, input } => {
             if let Some(idx) = app.active_assistant_idx.take() {
@@ -859,7 +926,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.rendered.push(RenderedEntry::new(Role::Tool));
             let idx = app.transcript.len().saturating_sub(1);
             app.tool_entry_for_id.insert(id, idx);
-            app.status = format!("running {name}...");
+            app.status = tool_activity_status(&name, &input);
         }
         QueryEvent::ToolUseResult {
             id,
@@ -1055,7 +1122,6 @@ fn render_permission_modal(
     let body = format_permission_prompt_text(prompt);
     let para = Paragraph::new(body)
         .block(block)
-        .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White).bg(Color::Black));
 
     f.render_widget(para, popup);
@@ -1064,9 +1130,9 @@ fn render_permission_modal(
 fn format_permission_prompt_text(prompt: &PermissionPrompt) -> String {
     let mut out = String::new();
     out.push_str("Allow this tool call?\n\n");
-    out.push_str(&tool_input_summary_plain(&prompt.tool_name, &prompt.input));
+    out.push_str(&prompt.details);
     out.push_str(&format!("\n\nTool call id: {}\n", prompt.id));
-    out.push_str("\n[y] allow  [n] deny  [a] always allow (this session)\n");
+    out.push_str("\n[y] allow once  [n] deny  [a] always allow (saved)\n");
     out
 }
 
@@ -1191,11 +1257,460 @@ fn render_value_pretty(v: &serde_json::Value) -> String {
     }
 }
 
+fn tool_activity_status(tool_name: &str, input: &serde_json::Value) -> String {
+    match tool_name {
+        "Bash" => {
+            if let Some(desc) = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return crate::one_line_preview(desc, 120);
+            }
+
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if cmd.is_empty() {
+                "Running Bash...".to_string()
+            } else {
+                format!("Running: {}", crate::one_line_preview(cmd, 120))
+            }
+        }
+        "Read" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if path.is_empty() {
+                "Reading file...".to_string()
+            } else {
+                format!("Reading {}", crate::one_line_preview(path, 120))
+            }
+        }
+        "Write" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if path.is_empty() {
+                "Writing file...".to_string()
+            } else {
+                format!("Writing {}", crate::one_line_preview(path, 120))
+            }
+        }
+        "Edit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if path.is_empty() {
+                "Editing file...".to_string()
+            } else {
+                format!("Editing {}", crate::one_line_preview(path, 120))
+            }
+        }
+        "Glob" => {
+            let pat = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if pat.is_empty() {
+                "Searching files...".to_string()
+            } else {
+                format!("Searching files: {}", crate::one_line_preview(pat, 120))
+            }
+        }
+        "Grep" => {
+            let pat = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if pat.is_empty() {
+                "Searching...".to_string()
+            } else {
+                format!("Searching: {}", crate::one_line_preview(pat, 120))
+            }
+        }
+        _ => format!("Running {tool_name}..."),
+    }
+}
+
+fn permission_details(cwd: &Path, tool_name: &str, input: &serde_json::Value) -> String {
+    let mut out = String::new();
+
+    match tool_name {
+        "Bash" => {
+            let desc = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if !desc.is_empty() {
+                out.push_str("Description:\n");
+                out.push_str(desc);
+                out.push_str("\n\n");
+            }
+
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("Command:\n");
+            out.push_str(cmd);
+        }
+        "Edit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("File:\n");
+            out.push_str(path);
+
+            out.push_str("\n\nDiff preview:\n");
+            out.push_str(&edit_diff_preview(cwd, input));
+        }
+        "Write" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("File:\n");
+            out.push_str(path);
+
+            out.push_str("\n\nDiff preview:\n");
+            out.push_str(&write_diff_preview(cwd, input));
+        }
+        _ => {
+            out.push_str(&tool_input_summary_plain(tool_name, input));
+        }
+    }
+
+    truncate_with_notice(&out, 18_000)
+}
+
+fn persist_always_allow_tool(settings_path: &Path, tool_name: &str) -> anyhow::Result<bool> {
+    let tool_name = tool_name.trim();
+    if tool_name.is_empty() {
+        anyhow::bail!("tool name is empty");
+    }
+
+    let _lock = crate::lock_settings_path(settings_path)?;
+    let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
+    let Some(obj) = root.as_object_mut() else {
+        anyhow::bail!("settings root must be a JSON object: {}", settings_path.display());
+    };
+
+    let entry = obj
+        .entry("alwaysAllowTools".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+
+    let serde_json::Value::Array(arr) = entry else {
+        anyhow::bail!(
+            "\"alwaysAllowTools\" must be a JSON array in {}",
+            settings_path.display()
+        );
+    };
+
+    for v in arr.iter() {
+        if v.as_str().is_none() {
+            anyhow::bail!(
+                "\"alwaysAllowTools\" must contain only strings in {}",
+                settings_path.display()
+            );
+        }
+    }
+
+    if arr
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|s| s.eq_ignore_ascii_case(tool_name))
+    {
+        return Ok(false);
+    }
+
+    arr.push(serde_json::Value::String(tool_name.to_string()));
+    crate::save_settings_json(settings_path, &root)?;
+    Ok(true)
+}
+
+fn truncate_with_notice(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = crate::truncate_chars(s, max_chars);
+    out.push_str("\n\n(truncated)");
+    out
+}
+
+fn resolve_tool_path(cwd: &Path, raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return cwd.to_path_buf();
+    }
+
+    let expanded = expand_tilde(raw);
+    let abs = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    normalize_path(&abs)
+}
+
+fn expand_tilde(input: &str) -> PathBuf {
+    if input == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(input));
+    }
+
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+
+    PathBuf::from(input)
+}
+
+/// Best-effort lexical normalization (no filesystem access).
+///
+/// This is not a full canonicalization, but it removes `.` and resolves `..`.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let popped = out.pop();
+                if !popped {
+                    out.push(c);
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn edit_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
+    const MAX_FILE_BYTES: u64 = 512 * 1024;
+    const MAX_NEW_CHARS: usize = 200_000;
+    const MAX_DIFF_CHARS: usize = 14_000;
+
+    let raw_path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    if raw_path.is_empty() {
+        return "(preview unavailable) missing required field: file_path".to_string();
+    }
+
+    let old_string = input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let new_string = input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let replace_all = input
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if old_string == new_string {
+        return "(preview) old_string and new_string are identical; no edit to apply".to_string();
+    }
+
+    if new_string.chars().count() > MAX_NEW_CHARS {
+        return "(preview unavailable) new_string is too large".to_string();
+    }
+
+    let path = resolve_tool_path(cwd, raw_path);
+    if !path.starts_with(cwd) {
+        return format!(
+            "(preview unavailable) path is outside the working directory: {}",
+            path.display()
+        );
+    }
+
+    if !path.exists() {
+        if old_string.is_empty() {
+            let header_a = format!("a/{}", path.display());
+            let header_b = format!("b/{}", path.display());
+            let diff = TextDiff::from_lines("", new_string)
+                .unified_diff()
+                .header(&header_a, &header_b)
+                .to_string();
+            return truncate_with_notice(diff.trim_end(), MAX_DIFF_CHARS);
+        }
+        return format!("(preview) file does not exist: {}", path.display());
+    }
+
+    if old_string.is_empty() {
+        return "(preview) old_string must be non-empty when editing an existing file".to_string();
+    }
+
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(err) => return format!("(preview unavailable) cannot stat {}: {err}", path.display()),
+    };
+    if meta.is_dir() {
+        return format!("(preview) path is a directory: {}", path.display());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return format!(
+            "(preview unavailable) file is too large ({} bytes)",
+            meta.len()
+        );
+    }
+
+    let original = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(err) => {
+            return format!(
+                "(preview unavailable) failed to read {}: {err}",
+                path.display()
+            )
+        }
+    };
+
+    let (updated, count) = if replace_all {
+        let count = original.matches(old_string).count();
+        (original.replace(old_string, new_string), count)
+    } else {
+        match original.find(old_string) {
+            Some(idx) => {
+                let mut s = String::with_capacity(
+                    original
+                        .len()
+                        .saturating_sub(old_string.len())
+                        .saturating_add(new_string.len()),
+                );
+                s.push_str(&original[..idx]);
+                s.push_str(new_string);
+                s.push_str(&original[idx + old_string.len()..]);
+                (s, 1)
+            }
+            None => (original.clone(), 0),
+        }
+    };
+
+    if count == 0 {
+        return format!("(preview) old_string not found in {}", path.display());
+    }
+
+    let mode = if replace_all { "all" } else { "first" };
+    let header_a = format!("a/{}", path.display());
+    let header_b = format!("b/{}", path.display());
+    let diff = TextDiff::from_lines(&original, &updated)
+        .unified_diff()
+        .header(&header_a, &header_b)
+        .to_string();
+
+    let mut out = format!("(preview) would replace {mode} occurrence(s): {count}\n\n");
+    out.push_str(diff.trim_end());
+    truncate_with_notice(&out, MAX_DIFF_CHARS)
+}
+
+fn write_diff_preview(cwd: &Path, input: &serde_json::Value) -> String {
+    const MAX_FILE_BYTES: u64 = 512 * 1024;
+    const MAX_NEW_CHARS: usize = 200_000;
+    const MAX_DIFF_CHARS: usize = 14_000;
+
+    let raw_path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    if raw_path.is_empty() {
+        return "(preview unavailable) missing required field: file_path".to_string();
+    }
+
+    let content = input.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+    if content.chars().count() > MAX_NEW_CHARS {
+        return "(preview unavailable) content is too large".to_string();
+    }
+
+    let path = resolve_tool_path(cwd, raw_path);
+    if !path.starts_with(cwd) {
+        return format!(
+            "(preview unavailable) path is outside the working directory: {}",
+            path.display()
+        );
+    }
+
+    let existed = path.exists();
+    let original = if existed {
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(err) => {
+                return format!("(preview unavailable) cannot stat {}: {err}", path.display())
+            }
+        };
+        if meta.is_dir() {
+            return format!("(preview) path is a directory: {}", path.display());
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return format!(
+                "(preview unavailable) file is too large ({} bytes)",
+                meta.len()
+            );
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(err) => {
+                return format!(
+                    "(preview unavailable) failed to read {}: {err}",
+                    path.display()
+                )
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    if original == content {
+        return "(preview) no changes".to_string();
+    }
+
+    let header_a = format!("a/{}", path.display());
+    let header_b = format!("b/{}", path.display());
+    let diff = TextDiff::from_lines(&original, content)
+        .unified_diff()
+        .header(&header_a, &header_b)
+        .to_string();
+
+    let kind = if existed { "update" } else { "create" };
+    let mut out = format!("(preview) would {kind} file\n\n");
+    out.push_str(diff.trim_end());
+    truncate_with_notice(&out, MAX_DIFF_CHARS)
+}
+
 fn tool_primary_summary(tool_name: &str, input: &serde_json::Value) -> Option<String> {
     match tool_name {
         "Bash" => input.get("command").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
-        "Write" | "Edit" => input
+        "Read" | "Write" | "Edit" => input
             .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
+        "Glob" | "Grep" => input
+            .get("pattern")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string()),
         "NotebookEdit" => input
