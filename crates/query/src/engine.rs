@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +24,48 @@ use crate::cost::calculate_usd_cost;
 use crate::mcp_tools::connect_mcp_tools;
 use crate::stream_parser::StreamParser;
 use crate::system_prompt::{SystemPromptParts, build_system_prompt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    AllowOnce,
+    Deny,
+    /// Allow this tool for the remainder of the current `QueryEngine::run*` call.
+    /// (Persistence is handled by higher layers.)
+    AlwaysAllowTool,
+}
+
+#[async_trait]
+pub trait QueryObserver: Send + Sync {
+    /// Called immediately before a tool is executed (after permission is granted).
+    async fn on_tool_use_start(
+        &self,
+        _id: &str,
+        _name: &str,
+        _input: &serde_json::Value,
+    ) {
+    }
+
+    /// Called after a tool completes (or is denied/invalid).
+    async fn on_tool_use_result(
+        &self,
+        _id: &str,
+        _name: &str,
+        _input: &serde_json::Value,
+        _result: &serde_json::Value,
+        _is_error: bool,
+    ) {
+    }
+
+    /// Request interactive permission for a tool call. Default is deny.
+    async fn request_permission(
+        &self,
+        _id: &str,
+        _name: &str,
+        _input: &serde_json::Value,
+    ) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct QueryEngineConfig {
@@ -115,8 +157,33 @@ impl QueryEngine {
 
     pub async fn run_with_history<F>(
         &self,
+        history: Vec<Message>,
+        on_event: F,
+    ) -> anyhow::Result<RunResult>
+    where
+        F: FnMut(&serde_json::Value) -> anyhow::Result<()> + Send,
+    {
+        self.run_with_history_inner(history, on_event, None).await
+    }
+
+    pub async fn run_with_history_observed<F>(
+        &self,
+        history: Vec<Message>,
+        on_event: F,
+        observer: Arc<dyn QueryObserver>,
+    ) -> anyhow::Result<RunResult>
+    where
+        F: FnMut(&serde_json::Value) -> anyhow::Result<()> + Send,
+    {
+        self.run_with_history_inner(history, on_event, Some(observer))
+            .await
+    }
+
+    async fn run_with_history_inner<F>(
+        &self,
         mut history: Vec<Message>,
         mut on_event: F,
+        observer: Option<Arc<dyn QueryObserver>>,
     ) -> anyhow::Result<RunResult>
     where
         F: FnMut(&serde_json::Value) -> anyhow::Result<()> + Send,
@@ -201,6 +268,7 @@ impl QueryEngine {
         };
 
         let mut did_reactive_compact: bool = false;
+        let mut always_allow_tools: HashSet<String> = HashSet::new();
 
         loop {
             turns += 1;
@@ -329,12 +397,17 @@ impl QueryEngine {
                     anyhow::bail!("stop_reason=tool_use but no tool_use blocks found");
                 }
 
-                let can_parallelize = tool_calls.len() > 1
+                // When an observer is present we may need interactive permission prompts,
+                // so keep tool execution sequential for deterministic UI and safety.
+                let can_parallelize = observer.is_none()
+                    && tool_calls.len() > 1
                     && tool_calls.iter().all(|call| {
                         tools.get(&call.name).is_some_and(|t| {
                             t.is_concurrency_safe(&call.input) && t.is_read_only(&call.input)
                         })
                     });
+
+                let observer_ref = observer.as_deref();
 
                 let tool_results: Vec<ContentBlock> = if can_parallelize {
                     let ids: Vec<String> = tool_calls.iter().map(|c| c.id.clone()).collect();
@@ -344,7 +417,9 @@ impl QueryEngine {
                         let tools = tools.clone();
                         let mut ctx = tool_ctx.clone();
                         handles.push(tokio::spawn(async move {
-                            execute_tool_call(&tools, &mut ctx, call).await
+                            let mut always_allow_tools: HashSet<String> = HashSet::new();
+                            execute_tool_call(&tools, &mut ctx, call, None, &mut always_allow_tools)
+                                .await
                         }));
                     }
 
@@ -368,7 +443,14 @@ impl QueryEngine {
                 } else {
                     let mut tool_results: Vec<ContentBlock> = Vec::new();
                     for call in tool_calls {
-                        let block = execute_tool_call(&tools, &mut tool_ctx, call).await;
+                        let block = execute_tool_call(
+                            &tools,
+                            &mut tool_ctx,
+                            call,
+                            observer_ref,
+                            &mut always_allow_tools,
+                        )
+                        .await;
                         tool_results.push(block);
                     }
                     tool_results
@@ -425,39 +507,140 @@ async fn execute_tool_call(
     tools: &ToolRegistry,
     ctx: &mut ToolUseContext,
     call: ToolCall,
+    observer: Option<&dyn QueryObserver>,
+    always_allow_tools: &mut HashSet<String>,
 ) -> ContentBlock {
     let ToolCall { id, name, input } = call;
+    let input_snapshot = input.clone();
 
     let Some(tool) = tools.get(&name) else {
+        let content =
+            serde_json::Value::String(format!("unknown tool: {name}"));
+        if let Some(obs) = observer {
+            obs.on_tool_use_result(&id, &name, &input, &content, true)
+                .await;
+        }
         return ContentBlock::ToolResult {
             tool_use_id: id,
-            content: serde_json::Value::String(format!("unknown tool: {name}")),
+            content,
             is_error: true,
         };
     };
 
     if let Err(err) = tool.validate_input(&input, ctx).await {
+        let content =
+            serde_json::Value::String(format!("invalid tool input: {err}"));
+        if let Some(obs) = observer {
+            obs.on_tool_use_result(&id, &name, &input, &content, true)
+                .await;
+        }
         return ContentBlock::ToolResult {
             tool_use_id: id,
-            content: serde_json::Value::String(format!("invalid tool input: {err}")),
+            content,
             is_error: true,
         };
     }
 
-    match tool.check_permissions(&input, ctx).await {
-        PermissionResult::Allow => {}
-        PermissionResult::Deny { reason } => {
+    // If the tool was previously always-allowed (within this run), temporarily
+    // lift the permission-mode gate.
+    let mut permission_override: Option<PermissionMode> = None;
+    let bypass_prompt = ctx.permission_mode == PermissionMode::Default && always_allow_tools.contains(&name);
+    if bypass_prompt {
+        permission_override = Some(PermissionMode::AcceptEdits);
+    }
+
+    // First check permissions in the configured mode.
+    let perm = tool.check_permissions(&input, ctx).await;
+
+    // If the tool is blocked only due to the Default-mode permission gate,
+    // ask the observer for interactive approval.
+    if let PermissionResult::Deny { reason } = perm {
+        let wants_prompt = !bypass_prompt
+            && ctx.permission_mode == PermissionMode::Default
+            && observer.is_some()
+            && is_permission_mode_denial(&reason);
+
+        if wants_prompt {
+            let decision = observer
+                .expect("checked observer.is_some()")
+                .request_permission(&id, &name, &input_snapshot)
+                .await;
+
+            match decision {
+                PermissionDecision::Deny => {
+                    let content = serde_json::Value::String(format!("permission denied: {reason}"));
+                    if let Some(obs) = observer {
+                        obs.on_tool_use_result(&id, &name, &input_snapshot, &content, true)
+                            .await;
+                    }
+                    return ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content,
+                        is_error: true,
+                    };
+                }
+                PermissionDecision::AllowOnce => {
+                    permission_override = Some(PermissionMode::AcceptEdits);
+                }
+                PermissionDecision::AlwaysAllowTool => {
+                    always_allow_tools.insert(name.clone());
+                    permission_override = Some(PermissionMode::AcceptEdits);
+                }
+            }
+        } else if permission_override.is_none() {
+            let content = serde_json::Value::String(format!("permission denied: {reason}"));
+            if let Some(obs) = observer {
+                obs.on_tool_use_result(&id, &name, &input_snapshot, &content, true)
+                    .await;
+            }
             return ContentBlock::ToolResult {
                 tool_use_id: id,
-                content: serde_json::Value::String(format!("permission denied: {reason}")),
+                content,
                 is_error: true,
             };
         }
     }
 
+    if let Some(mode) = permission_override {
+        let old = ctx.permission_mode;
+        ctx.permission_mode = mode;
+        let checked = tool.check_permissions(&input, ctx).await;
+        ctx.permission_mode = old;
+        match checked {
+            PermissionResult::Allow => {}
+            PermissionResult::Deny { reason } => {
+                let content =
+                    serde_json::Value::String(format!("permission denied: {reason}"));
+                if let Some(obs) = observer {
+                    obs.on_tool_use_result(&id, &name, &input_snapshot, &content, true)
+                        .await;
+                }
+                return ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content,
+                    is_error: true,
+                };
+            }
+        }
+    }
+
+    if let Some(obs) = observer {
+        obs.on_tool_use_start(&id, &name, &input_snapshot).await;
+    }
+
     match tool.call(input, ctx).await {
         Ok(mut result) => {
             persist_large_tool_result(tool.as_ref(), &mut result, ctx);
+            if let Some(obs) = observer {
+                obs.on_tool_use_result(
+                    &id,
+                    &name,
+                    &input_snapshot,
+                    &result.content,
+                    result.is_error,
+                )
+                    .await;
+            }
 
             ContentBlock::ToolResult {
                 tool_use_id: id,
@@ -465,12 +648,25 @@ async fn execute_tool_call(
                 is_error: result.is_error,
             }
         }
-        Err(err) => ContentBlock::ToolResult {
-            tool_use_id: id,
-            content: serde_json::Value::String(format!("tool failed: {err}")),
-            is_error: true,
-        },
+        Err(err) => {
+            let content = serde_json::Value::String(format!("tool failed: {err}"));
+            if let Some(obs) = observer {
+                obs.on_tool_use_result(&id, &name, &input_snapshot, &content, true)
+                    .await;
+            }
+            ContentBlock::ToolResult {
+                tool_use_id: id,
+                content,
+                is_error: true,
+            }
+        }
     }
+}
+
+fn is_permission_mode_denial(reason: &str) -> bool {
+    // Built-in tools use this phrasing for the "needs interactive approval" path in Default mode.
+    // We only prompt the observer in this case, not for e.g. invalid inputs or path restrictions.
+    reason.contains("disabled in this permission mode") || reason.contains("Re-run with --permission-mode")
 }
 
 fn persist_large_tool_result(

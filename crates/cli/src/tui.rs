@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use claude_core::types::ids::SessionId;
 use claude_core::types::message::{ContentBlock, Message, UserMessage};
 use claude_core::types::permissions::PermissionMode;
@@ -14,9 +16,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::args::{Args, InputFormat, OutputFormat};
 
@@ -30,6 +32,7 @@ const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 enum Role {
     User,
     Assistant,
+    Tool,
     System,
 }
 
@@ -63,6 +66,10 @@ struct App {
     md: MarkdownRenderer,
     history: Vec<Message>,
 
+    // Week 4: tools + permissions
+    tool_entry_for_id: HashMap<String, usize>,
+    permission_prompt: Option<PermissionPrompt>,
+
     // Week 3: scrollback + virtualization
     /// Start line (0-based) of the transcript viewport.
     scroll_top: usize,
@@ -82,8 +89,86 @@ struct App {
 #[derive(Debug)]
 enum QueryEvent {
     TextDelta(String),
+    ToolUseStart {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolUseResult {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        result: serde_json::Value,
+        is_error: bool,
+    },
+    PermissionRequest {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        reply_tx: oneshot::Sender<claude_query::PermissionDecision>,
+    },
     Finished(claude_query::RunResult),
     Error(String),
+}
+
+struct PermissionPrompt {
+    id: String,
+    tool_name: String,
+    input: serde_json::Value,
+    reply_tx: oneshot::Sender<claude_query::PermissionDecision>,
+}
+
+#[derive(Clone)]
+struct TuiObserver {
+    tx: mpsc::UnboundedSender<QueryEvent>,
+}
+
+#[async_trait]
+impl claude_query::QueryObserver for TuiObserver {
+    async fn on_tool_use_start(&self, id: &str, name: &str, input: &serde_json::Value) {
+        let _ = self.tx.send(QueryEvent::ToolUseStart {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+        });
+    }
+
+    async fn on_tool_use_result(
+        &self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+        result: &serde_json::Value,
+        is_error: bool,
+    ) {
+        let _ = self.tx.send(QueryEvent::ToolUseResult {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+            result: result.clone(),
+            is_error,
+        });
+    }
+
+    async fn request_permission(
+        &self,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> claude_query::PermissionDecision {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(QueryEvent::PermissionRequest {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: input.clone(),
+            reply_tx,
+        });
+
+        match reply_rx.await {
+            Ok(d) => d,
+            Err(_) => claude_query::PermissionDecision::Deny,
+        }
+    }
 }
 
 struct TerminalGuard;
@@ -227,6 +312,12 @@ fn role_header(role: Role) -> Line<'static> {
         Role::Assistant => (
             "Claude",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Role::Tool => (
+            "Tool",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Role::System => (
             "System",
@@ -408,6 +499,8 @@ pub async fn run_tui(
         render_width: 0,
         md,
         history,
+        tool_entry_for_id: HashMap::new(),
+        permission_prompt: None,
         scroll_top: 0,
         scroll_follow: true,
         last_msg_view_height: 0,
@@ -559,6 +652,39 @@ async fn handle_term_event(
                 }
             }
 
+            if app.permission_prompt.is_some() {
+                let decision = match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        Some(claude_query::PermissionDecision::AllowOnce)
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        Some(claude_query::PermissionDecision::Deny)
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        Some(claude_query::PermissionDecision::AlwaysAllowTool)
+                    }
+                    _ => None,
+                };
+
+                if let Some(decision) = decision {
+                    if let Some(prompt) = app.permission_prompt.take() {
+                        let _ = prompt.reply_tx.send(decision);
+                        match decision {
+                            claude_query::PermissionDecision::AllowOnce => {
+                                app.status = format!("allowed {}", prompt.tool_name)
+                            }
+                            claude_query::PermissionDecision::AlwaysAllowTool => {
+                                app.status = format!("always allow {}", prompt.tool_name)
+                            }
+                            claude_query::PermissionDecision::Deny => {
+                                app.status = format!("denied {}", prompt.tool_name)
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+
             match key.code {
                 // Week 3: scrollback.
                 KeyCode::Up => {
@@ -618,19 +744,15 @@ fn submit_prompt(
         return Ok(());
     }
     app.input.clear();
+    app.permission_prompt = None;
+    app.tool_entry_for_id.clear();
+    app.active_assistant_idx = None;
 
     app.transcript.push(ChatEntry {
         role: Role::User,
         text: prompt.clone(),
     });
     app.rendered.push(RenderedEntry::new(Role::User));
-
-    app.transcript.push(ChatEntry {
-        role: Role::Assistant,
-        text: String::new(),
-    });
-    app.rendered.push(RenderedEntry::new_streaming(Role::Assistant));
-    app.active_assistant_idx = Some(app.transcript.len().saturating_sub(1));
 
     // Week 3: make sure the new turn is visible even if the user had scrolled up.
     scroll_to_bottom(app);
@@ -653,13 +775,17 @@ fn submit_prompt(
     let session_id = app.session_id;
 
     tokio::spawn(async move {
+        let tx_for_deltas = query_tx.clone();
+        let observer: std::sync::Arc<dyn claude_query::QueryObserver> =
+            std::sync::Arc::new(TuiObserver { tx: query_tx.clone() });
+
         let res = engine
-            .run_with_history(history_for_engine, |event| {
+            .run_with_history_observed(history_for_engine, |event| {
                 if let Some(text) = crate::extract_text_delta(event) {
-                    let _ = query_tx.send(QueryEvent::TextDelta(text.to_string()));
+                    let _ = tx_for_deltas.send(QueryEvent::TextDelta(text.to_string()));
                 }
                 Ok(())
-            })
+            }, observer)
             .await;
 
         match res {
@@ -702,10 +828,68 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 cache.dirty = true;
             }
         }
+        QueryEvent::PermissionRequest {
+            id,
+            name,
+            input,
+            reply_tx,
+        } => {
+            // The assistant turn that requested tool use has finished streaming at this point.
+            if let Some(idx) = app.active_assistant_idx.take() {
+                app.finalize_streaming(idx);
+            }
+            app.permission_prompt = Some(PermissionPrompt {
+                id,
+                tool_name: name,
+                input,
+                reply_tx,
+            });
+            app.status = "permission required".to_string();
+        }
+        QueryEvent::ToolUseStart { id, name, input } => {
+            if let Some(idx) = app.active_assistant_idx.take() {
+                app.finalize_streaming(idx);
+            }
+
+            let text = format_tool_running_markdown(&name, &input);
+            app.transcript.push(ChatEntry {
+                role: Role::Tool,
+                text,
+            });
+            app.rendered.push(RenderedEntry::new(Role::Tool));
+            let idx = app.transcript.len().saturating_sub(1);
+            app.tool_entry_for_id.insert(id, idx);
+            app.status = format!("running {name}...");
+        }
+        QueryEvent::ToolUseResult {
+            id,
+            name,
+            input,
+            result,
+            is_error,
+        } => {
+            let text = format_tool_result_markdown(&name, &input, &result, is_error);
+            if let Some(idx) = app.tool_entry_for_id.remove(&id) {
+                if let Some(entry) = app.transcript.get_mut(idx) {
+                    entry.text = text;
+                }
+                if let Some(cache) = app.rendered.get_mut(idx) {
+                    cache.dirty = true;
+                }
+            } else {
+                app.transcript.push(ChatEntry {
+                    role: Role::Tool,
+                    text,
+                });
+                app.rendered.push(RenderedEntry::new(Role::Tool));
+            }
+            app.status = format!("{name} done");
+        }
         QueryEvent::Finished(result) => {
             let finished_idx = app.active_assistant_idx;
             app.in_flight = false;
             app.active_assistant_idx = None;
+            app.permission_prompt = None;
             app.history = result.history;
             if let Some(idx) = finished_idx {
                 app.finalize_streaming(idx);
@@ -725,6 +909,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
         QueryEvent::Error(err) => {
             app.in_flight = false;
             app.active_assistant_idx = None;
+            app.permission_prompt = None;
 
             // If we created an empty assistant entry for streaming, remove it on error.
             if let Some(last) = app.transcript.last() {
@@ -800,7 +985,9 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let cursor_x = visible.chars().count().min(input_inner_w) as u16;
     let cursor_y = chunks[2].y + 1;
     let cursor_x = chunks[2].x + 1 + cursor_x;
-    f.set_cursor(cursor_x, cursor_y);
+    if app.permission_prompt.is_none() {
+        f.set_cursor(cursor_x, cursor_y);
+    }
 
     // Status
     let spin = if app.in_flight {
@@ -819,27 +1006,176 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let status = Line::from(format!("{spin} {}{scroll_hint}", app.status))
         .style(Style::default().fg(Color::Gray).add_modifier(Modifier::DIM));
     f.render_widget(Paragraph::new(status), chunks[3]);
+
+    // Week 4: permission modal overlay.
+    if let Some(prompt) = &app.permission_prompt {
+        render_permission_modal(f, prompt, size);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let percent_x = percent_x.min(100).max(1);
+    let percent_y = percent_y.min(100).max(1);
+
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1]);
+
+    horizontal[1]
+}
+
+fn render_permission_modal(
+    f: &mut ratatui::Frame<'_>,
+    prompt: &PermissionPrompt,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(80, 45, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let title = format!("Permission required • {}", prompt.tool_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+
+    let body = format_permission_prompt_text(prompt);
+    let para = Paragraph::new(body)
+        .block(block)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+
+    f.render_widget(para, popup);
+}
+
+fn format_permission_prompt_text(prompt: &PermissionPrompt) -> String {
+    let mut out = String::new();
+    out.push_str("Allow this tool call?\n\n");
+    out.push_str(&tool_input_summary_plain(&prompt.tool_name, &prompt.input));
+    out.push_str(&format!("\n\nTool call id: {}\n", prompt.id));
+    out.push_str("\n[y] allow  [n] deny  [a] always allow (this session)\n");
+    out
 }
 
 fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
-    let mut out = Vec::new();
+    let mut out: Vec<ChatEntry> = Vec::new();
+    let mut tool_input_for_id: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+    let mut tool_entry_for_id: HashMap<String, usize> = HashMap::new();
+
     for msg in history {
         match msg {
             Message::User(UserMessage { content }) => {
-                let text = extract_text_blocks(content);
-                if !text.trim().is_empty() {
+                let mut text_buf = String::new();
+
+                for b in content {
+                    match b {
+                        ContentBlock::Text { text } => {
+                            if !text_buf.is_empty() {
+                                text_buf.push('\n');
+                            }
+                            text_buf.push_str(text);
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            if !text_buf.trim().is_empty() {
+                                out.push(ChatEntry {
+                                    role: Role::User,
+                                    text: std::mem::take(&mut text_buf),
+                                });
+                            }
+
+                            let (tool_name, tool_input) = tool_input_for_id
+                                .get(tool_use_id)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    (
+                                        format!("Tool({})", tool_use_id),
+                                        serde_json::Value::Null,
+                                    )
+                                });
+
+                            let md = format_tool_result_markdown(
+                                &tool_name,
+                                &tool_input,
+                                content,
+                                *is_error,
+                            );
+
+                            if let Some(idx) = tool_entry_for_id.get(tool_use_id).copied() {
+                                if let Some(entry) = out.get_mut(idx) {
+                                    entry.text = md;
+                                }
+                            } else {
+                                out.push(ChatEntry {
+                                    role: Role::Tool,
+                                    text: md,
+                                });
+                            }
+                        }
+                        ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {}
+                    }
+                }
+
+                if !text_buf.trim().is_empty() {
                     out.push(ChatEntry {
                         role: Role::User,
-                        text,
+                        text: text_buf,
                     });
                 }
             }
             Message::Assistant(claude_core::types::message::AssistantMessage { content, .. }) => {
-                let text = extract_text_blocks(content);
-                if !text.trim().is_empty() {
+                let mut text_buf = String::new();
+
+                for b in content {
+                    match b {
+                        ContentBlock::Text { text } => {
+                            if !text_buf.is_empty() {
+                                text_buf.push('\n');
+                            }
+                            text_buf.push_str(text);
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            if !text_buf.trim().is_empty() {
+                                out.push(ChatEntry {
+                                    role: Role::Assistant,
+                                    text: std::mem::take(&mut text_buf),
+                                });
+                            }
+
+                            tool_input_for_id
+                                .insert(id.clone(), (name.clone(), input.clone()));
+
+                            let md = format_tool_running_markdown(name, input);
+                            out.push(ChatEntry {
+                                role: Role::Tool,
+                                text: md,
+                            });
+                            tool_entry_for_id.insert(id.clone(), out.len().saturating_sub(1));
+                        }
+                        ContentBlock::ToolResult { .. } | ContentBlock::Thinking { .. } => {}
+                    }
+                }
+
+                if !text_buf.trim().is_empty() {
                     out.push(ChatEntry {
                         role: Role::Assistant,
-                        text,
+                        text: text_buf,
                     });
                 }
             }
@@ -848,20 +1184,135 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
     out
 }
 
-fn extract_text_blocks(blocks: &[ContentBlock]) -> String {
+fn render_value_pretty(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn tool_primary_summary(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    match tool_name {
+        "Bash" => input.get("command").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
+        "Write" | "Edit" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
+        "NotebookEdit" => input
+            .get("notebook_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
+        "WebFetch" => input.get("url").and_then(|v| v.as_str()).map(|s| s.trim().to_string()),
+        "WebSearch" => input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
+        "Agent" => input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
+        _ => None,
+    }
+    .filter(|s| !s.is_empty())
+}
+
+fn format_tool_running_markdown(tool_name: &str, input: &serde_json::Value) -> String {
+    let Some(primary) = tool_primary_summary(tool_name, input) else {
+        let rendered = render_value_pretty(input);
+        let rendered = crate::truncate_chars(&rendered, 1200);
+        return format!("Running **{tool_name}**\n\n```json\n{rendered}\n```");
+    };
+
+    if primary.contains('\n') || primary.contains('`') {
+        let rendered = crate::truncate_chars(&primary, 1200);
+        return format!("Running **{tool_name}**\n\n```text\n{rendered}\n```");
+    }
+
+    let preview = crate::truncate_chars(primary.trim(), 200);
+    format!("Running **{tool_name}**: `{preview}`")
+}
+
+fn format_tool_result_markdown(
+    tool_name: &str,
+    input: &serde_json::Value,
+    result: &serde_json::Value,
+    is_error: bool,
+) -> String {
     let mut out = String::new();
-    for b in blocks {
-        match b {
-            ContentBlock::Text { text } => {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(text);
-            }
-            _ => {}
+    let status = if is_error { " (error)" } else { "" };
+
+    if let Some(primary) = tool_primary_summary(tool_name, input) {
+        if !primary.contains('\n') && !primary.contains('`') {
+            let preview = crate::truncate_chars(primary.trim(), 200);
+            out.push_str(&format!("**{tool_name}**{status}: `{preview}`\n\n"));
+        } else {
+            let preview = crate::truncate_chars(primary.trim(), 1200);
+            out.push_str(&format!("**{tool_name}**{status}\n\n```text\n{preview}\n```\n\n"));
+        }
+    } else {
+        let rendered = crate::truncate_chars(&render_value_pretty(input), 1200);
+        out.push_str(&format!("**{tool_name}**{status}\n\n```json\n{rendered}\n```\n\n"));
+    }
+
+    let (lang, body) = match (tool_name, result) {
+        ("Edit", serde_json::Value::String(s)) => ("diff", crate::truncate_chars(s, 50_000)),
+        (_name, serde_json::Value::String(s)) => ("text", crate::truncate_chars(s, 50_000)),
+        (_name, other) => ("json", crate::truncate_chars(&render_value_pretty(other), 50_000)),
+    };
+
+    out.push_str("Result:\n");
+    out.push_str(&format!("```{lang}\n{body}\n```"));
+    out
+}
+
+fn tool_input_summary_plain(tool_name: &str, input: &serde_json::Value) -> String {
+    let mut out = String::new();
+
+    match tool_name {
+        "Bash" => {
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("Command:\n");
+            out.push_str(cmd);
+        }
+        "Write" | "Edit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("File:\n");
+            out.push_str(path);
+        }
+        "NotebookEdit" => {
+            let path = input
+                .get("notebook_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            out.push_str("Notebook:\n");
+            out.push_str(path);
+        }
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or_default().trim();
+            out.push_str("URL:\n");
+            out.push_str(url);
+        }
+        "WebSearch" => {
+            let q = input.get("query").and_then(|v| v.as_str()).unwrap_or_default().trim();
+            out.push_str("Query:\n");
+            out.push_str(q);
+        }
+        _ => {
+            out.push_str("Input:\n");
+            out.push_str(&render_value_pretty(input));
         }
     }
-    out
+
+    crate::truncate_chars(&out, 2200)
 }
 
 fn take_last_chars(s: &str, max: usize) -> String {

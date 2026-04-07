@@ -214,6 +214,11 @@ impl MarkdownRenderer {
     }
 
     fn highlight_code_block(&self, code: &str, lang: &str) -> Vec<Line<'static>> {
+        let lang_norm = lang.trim().to_ascii_lowercase();
+        if lang_norm == "diff" || lang_norm == "patch" {
+            return highlight_diff_block(code);
+        }
+
         let syntax = self
             .syntax_set
             .find_syntax_by_token(lang)
@@ -242,6 +247,39 @@ impl MarkdownRenderer {
         }
         out
     }
+}
+
+fn highlight_diff_block(code: &str) -> Vec<Line<'static>> {
+    let header_style = Style::default().fg(Color::DarkGray);
+    let hunk_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let add_style = Style::default().fg(Color::Green);
+    let del_style = Style::default().fg(Color::Red);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for raw_line in code.lines() {
+        let style = if raw_line.starts_with("diff ")
+            || raw_line.starts_with("index ")
+            || raw_line.starts_with("---")
+            || raw_line.starts_with("+++")
+        {
+            header_style
+        } else if raw_line.starts_with("@@") {
+            hunk_style
+        } else if raw_line.starts_with('+') && !raw_line.starts_with("+++") {
+            add_style
+        } else if raw_line.starts_with('-') && !raw_line.starts_with("---") {
+            del_style
+        } else {
+            Style::default()
+        };
+
+        out.push(Line::from(Span::styled(raw_line.to_string(), style)));
+    }
+
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
 }
 
 pub struct StreamingMarkdown {

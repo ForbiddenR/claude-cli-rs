@@ -5,4 +5,4 @@ mod mcp_tools;
 pub mod stream_parser;
 pub mod system_prompt;
 
-pub use engine::{QueryEngine, QueryEngineConfig, RunResult};
+pub use engine::{PermissionDecision, QueryEngine, QueryEngineConfig, QueryObserver, RunResult};
