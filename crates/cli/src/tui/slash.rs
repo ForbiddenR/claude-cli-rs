@@ -17,6 +17,26 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         usage: "/model [model-id]",
     },
     SlashCommandDef {
+        name: "theme",
+        description: "Show or set the UI theme",
+        usage: "/theme [dark|light]",
+    },
+    SlashCommandDef {
+        name: "status",
+        description: "Show session + runtime status details",
+        usage: "/status",
+    },
+    SlashCommandDef {
+        name: "vim",
+        description: "Toggle vim-style input editing",
+        usage: "/vim [on|off]",
+    },
+    SlashCommandDef {
+        name: "permissions",
+        description: "Show permission mode and always-allow rules",
+        usage: "/permissions",
+    },
+    SlashCommandDef {
         name: "clear",
         description: "Start a new empty session",
         usage: "/clear",

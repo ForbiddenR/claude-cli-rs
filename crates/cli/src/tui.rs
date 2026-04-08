@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -33,12 +33,14 @@ mod input;
 mod keymap;
 mod markdown;
 mod slash;
+mod theme;
 mod vim;
 
 use input::{InputBuffer, PromptHistory, ReverseHistorySearch};
 use keymap::{KeyAction, KeyContext, KeySequence, KeybindingResolver, ResolveOutcome};
 use markdown::{MarkdownRenderer, StreamingMarkdown};
 use slash::{SLASH_COMMANDS, SlashCommandDef, match_commands, parse_slash_command};
+use theme::{Theme, ThemeName};
 use vim::{VimHandleResult, VimKey, VimMachine, VimMode};
 
 const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
@@ -80,9 +82,14 @@ struct App {
     typeahead_selected: usize,
     typeahead_suppressed_text: Option<String>,
     status: String,
+    theme: Theme,
+    toasts: Vec<Toast>,
     spinner_idx: usize,
     in_flight: bool,
     active_assistant_idx: Option<usize>,
+    run_started_at: Option<Instant>,
+    run_stream_chars: usize,
+    last_turn_tokens_per_sec: Option<f64>,
 
     transcript: Vec<ChatEntry>,
     rendered: Vec<RenderedEntry>,
@@ -134,6 +141,20 @@ enum DialogState {
     ModelPicker(ModelPickerDialog),
     SessionResume(SessionResumeDialog),
     TranscriptSearch(TranscriptSearchDialog),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    level: ToastLevel,
+    message: String,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -311,17 +332,17 @@ impl Drop for TerminalGuard {
 }
 
 impl RenderedEntry {
-    fn new(role: Role) -> Self {
+    fn new(role: Role, theme: &Theme) -> Self {
         Self {
-            header: role_header(role),
+            header: role_header(theme, role),
             body: RenderedBody::Static(Vec::new()),
             dirty: true,
         }
     }
 
-    fn new_streaming(role: Role) -> Self {
+    fn new_streaming(role: Role, theme: &Theme) -> Self {
         Self {
-            header: role_header(role),
+            header: role_header(theme, role),
             body: RenderedBody::Streaming(StreamingMarkdown::new()),
             dirty: true,
         }
@@ -354,7 +375,7 @@ impl App {
         // Defensive: keep caches aligned even if a future edit forgets to push/pop both.
         while self.rendered.len() < self.transcript.len() {
             let role = self.transcript[self.rendered.len()].role;
-            self.rendered.push(RenderedEntry::new(role));
+            self.rendered.push(RenderedEntry::new(role, &self.theme));
         }
         if self.rendered.len() > self.transcript.len() {
             self.rendered.truncate(self.transcript.len());
@@ -536,8 +557,44 @@ impl App {
             role: Role::System,
             text: text.into(),
         });
-        self.rendered.push(RenderedEntry::new(Role::System));
+        self.rendered.push(RenderedEntry::new(Role::System, &self.theme));
         scroll_to_bottom(self);
+    }
+
+    fn push_toast(&mut self, level: ToastLevel, message: impl Into<String>, ttl: Duration) {
+        let msg = message.into();
+        if msg.trim().is_empty() {
+            return;
+        }
+
+        let expires_at = Instant::now() + ttl;
+        self.toasts.push(Toast {
+            level,
+            message: msg,
+            expires_at,
+        });
+
+        // Avoid unbounded growth if something spams notifications.
+        if self.toasts.len() > 32 {
+            let drain = self.toasts.len().saturating_sub(32);
+            self.toasts.drain(0..drain);
+        }
+    }
+
+    fn prune_toasts(&mut self) {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.expires_at > now);
+    }
+
+    fn apply_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+
+        // Update per-entry cached headers so role colors match the new theme.
+        let n = self.rendered.len().min(self.transcript.len());
+        for idx in 0..n {
+            let role = self.transcript[idx].role;
+            self.rendered[idx].header = role_header(&self.theme, role);
+        }
     }
 
     fn clear_chat(&mut self) -> anyhow::Result<()> {
@@ -552,6 +609,9 @@ impl App {
         self.tool_entry_for_id.clear();
         self.permission_prompt = None;
         self.active_assistant_idx = None;
+        self.in_flight = false;
+        self.run_started_at = None;
+        self.run_stream_chars = 0;
         self.dismiss_typeahead();
         self.scroll_top = 0;
         self.scroll_follow = true;
@@ -611,6 +671,8 @@ impl App {
         self.dismiss_typeahead();
         self.dialog = None;
         self.in_flight = false;
+        self.run_started_at = None;
+        self.run_stream_chars = 0;
         self.transcript = transcript_from_history(&self.history);
         if self.transcript.is_empty() {
             self.transcript.push(ChatEntry {
@@ -621,7 +683,7 @@ impl App {
         self.rendered = self
             .transcript
             .iter()
-            .map(|entry| RenderedEntry::new(entry.role))
+            .map(|entry| RenderedEntry::new(entry.role, &self.theme))
             .collect();
         self.render_width = 0;
         self.scroll_top = 0;
@@ -696,30 +758,12 @@ fn slash_command_help() -> String {
     out
 }
 
-fn role_header(role: Role) -> Line<'static> {
+fn role_header(theme: &Theme, role: Role) -> Line<'static> {
     let (label, style) = match role {
-        Role::User => (
-            "You",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Role::Assistant => (
-            "Claude",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Role::Tool => (
-            "Tool",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Role::System => (
-            "System",
-            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
-        ),
+        Role::User => ("You", theme.role_user),
+        Role::Assistant => ("Claude", theme.role_assistant),
+        Role::Tool => ("Tool", theme.role_tool),
+        Role::System => ("System", theme.role_system),
     };
 
     Line::from(Span::styled(label, style))
@@ -958,9 +1002,17 @@ pub async fn run_tui(
             ),
         });
     }
+
+    let theme_name = settings
+        .tui_theme
+        .as_deref()
+        .and_then(ThemeName::parse)
+        .unwrap_or(ThemeName::Dark);
+    let theme = Theme::new(theme_name);
+
     let rendered = transcript
         .iter()
-        .map(|e| RenderedEntry::new(e.role))
+        .map(|e| RenderedEntry::new(e.role, &theme))
         .collect();
 
     let client = claude_services::api::AnthropicClient::new(None);
@@ -985,9 +1037,14 @@ pub async fn run_tui(
         typeahead_selected: 0,
         typeahead_suppressed_text: None,
         status: "ready".to_string(),
+        theme: theme.clone(),
+        toasts: Vec::new(),
         spinner_idx: 0,
         in_flight: false,
         active_assistant_idx: None,
+        run_started_at: None,
+        run_stream_chars: 0,
+        last_turn_tokens_per_sec: None,
         transcript,
         rendered,
         render_width: 0,
@@ -1038,6 +1095,7 @@ pub async fn run_tui(
                 handle_query_event(&mut app, qev);
             }
             _ = tick.tick() => {
+                app.prune_toasts();
                 if app.in_flight {
                     app.spinner_idx = (app.spinner_idx + 1) % SPINNER_FRAMES.len();
                 }
@@ -1229,18 +1287,33 @@ async fn handle_term_event(
                             match saved {
                                 Ok(true) => {
                                     app.status =
-                                        format!("always allow {} (saved)", prompt.tool_name)
+                                        format!("always allow {} (saved)", prompt.tool_name);
+                                    app.push_toast(
+                                        ToastLevel::Info,
+                                        format!("Always allow saved: {}", prompt.tool_name),
+                                        Duration::from_secs(3),
+                                    );
                                 }
                                 Ok(false) => {
                                     app.status =
-                                        format!("always allow {} (already saved)", prompt.tool_name)
+                                        format!("always allow {} (already saved)", prompt.tool_name);
+                                    app.push_toast(
+                                        ToastLevel::Info,
+                                        format!("Always allow already set: {}", prompt.tool_name),
+                                        Duration::from_secs(3),
+                                    );
                                 }
                                 Err(err) => {
                                     app.status = format!(
                                         "always allow {} (save failed: {})",
                                         prompt.tool_name,
                                         crate::one_line_preview(&err.to_string(), 120)
-                                    )
+                                    );
+                                    app.push_toast(
+                                        ToastLevel::Warn,
+                                        "Failed to save always-allow",
+                                        Duration::from_secs(4),
+                                    );
                                 }
                             }
                         }
@@ -1655,9 +1728,172 @@ async fn execute_slash_command(
                     app.model = next.clone();
                     app.rebuild_engine()?;
                     app.push_system_message(format!("Model updated to `{next}`"));
+                    app.push_toast(ToastLevel::Info, format!("Model: {next}"), Duration::from_secs(3));
                     app.status = format!("model {}", app.model);
                 }
             }
+        }
+        "theme" => {
+            if args.is_empty() {
+                let names = Theme::available_names().join(", ");
+                app.push_system_message(format!(
+                    "Theme\n\n- current: `{}`\n- available: {names}\n\nUsage: /theme [dark|light]",
+                    app.theme.name.as_str()
+                ));
+                app.status = format!("theme {}", app.theme.name.as_str());
+            } else {
+                let raw = args.join(" ");
+                let raw = raw.trim();
+                let Some(name) = ThemeName::parse(raw) else {
+                    let names = Theme::available_names().join(", ");
+                    app.push_system_message(format!(
+                        "Unknown theme `{}`.\n\nAvailable: {names}\n\nUsage: /theme [dark|light]",
+                        crate::one_line_preview(raw, 80)
+                    ));
+                    app.status = "theme usage".to_string();
+                    return Ok(false);
+                };
+
+                if name == app.theme.name {
+                    app.status = format!("theme {}", name.as_str());
+                    return Ok(false);
+                }
+
+                app.apply_theme(Theme::new(name));
+                if let Err(err) = persist_tui_theme(&app.user_settings_path, name.as_str()) {
+                    app.push_system_message(format!("warn: failed to persist theme: {err}"));
+                }
+                app.push_toast(
+                    ToastLevel::Info,
+                    format!("Theme: {}", name.as_str()),
+                    Duration::from_secs(3),
+                );
+                app.status = format!("theme {}", name.as_str());
+            }
+        }
+        "status" => {
+            let always_allow = match app.always_allow_tools.lock() {
+                Ok(set) => {
+                    let mut items = set.iter().cloned().collect::<Vec<_>>();
+                    items.sort();
+                    items
+                }
+                Err(_) => Vec::new(),
+            };
+
+            let last_tps = app
+                .last_turn_tokens_per_sec
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "unavailable".to_string());
+
+            let total_cost = app
+                .total_cost_usd
+                .map(|v| format!("${v:.4}"))
+                .unwrap_or_else(|| "unavailable".to_string());
+
+            let body = format!(
+                "Status\n\n\
+- session: `{}`\n\
+- session file: `{}`\n\
+- cwd: `{}`\n\
+- model: `{}`\n\
+- theme: `{}`\n\
+- mode: `{}`\n\
+- in flight: `{}`\n\
+- scroll: `{}`\n\
+- permissionMode: `{:?}`\n\
+- alwaysAllowTools: {}{}\n\
+- totals: in={} out={} cost={}\n\
+- last turn: in={} out={} cost={} t/s={}\n",
+                app.session_id,
+                app.session_path.display(),
+                app.cwd.display(),
+                app.model,
+                app.theme.name.as_str(),
+                if app.vim.is_some() { "vim" } else { "normal" },
+                app.in_flight,
+                if app.scroll_follow {
+                    "follow".to_string()
+                } else {
+                    format!("locked (top line {})", app.scroll_top)
+                },
+                app.engine_inputs.cfg.permission_mode,
+                always_allow.len(),
+                if always_allow.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" ({})", always_allow.join(", "))
+                },
+                app.total_input_tokens,
+                app.total_output_tokens,
+                total_cost,
+                app.last_turn_input_tokens,
+                app.last_turn_output_tokens,
+                app.last_turn_cost_usd
+                    .map(|v| format!("${v:.4}"))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                last_tps,
+            );
+
+            app.push_system_message(body);
+            app.status = "status".to_string();
+        }
+        "vim" => {
+            let mut desired: Option<bool> = None;
+            if !args.is_empty() {
+                let raw = args.join(" ").trim().to_ascii_lowercase();
+                match raw.as_str() {
+                    "on" | "enable" | "enabled" => desired = Some(true),
+                    "off" | "disable" | "disabled" => desired = Some(false),
+                    _ => {
+                        app.push_system_message("usage: /vim [on|off]");
+                        app.status = "vim usage".to_string();
+                        return Ok(false);
+                    }
+                }
+            }
+
+            let next_on = desired.unwrap_or(app.vim.is_none());
+            if next_on {
+                if app.vim.is_none() {
+                    app.vim = Some(VimMachine::new());
+                    app.push_toast(ToastLevel::Info, "Vim mode enabled", Duration::from_secs(3));
+                }
+                app.status = "vim on".to_string();
+            } else {
+                if app.vim.take().is_some() {
+                    app.push_toast(ToastLevel::Info, "Vim mode disabled", Duration::from_secs(3));
+                }
+                app.status = "vim off".to_string();
+            }
+        }
+        "permissions" => {
+            let always_allow = match app.always_allow_tools.lock() {
+                Ok(set) => {
+                    let mut items = set.iter().cloned().collect::<Vec<_>>();
+                    items.sort();
+                    items
+                }
+                Err(_) => Vec::new(),
+            };
+
+            let body = format!(
+                "Permissions\n\n\
+- permissionMode: `{:?}`\n\
+- alwaysAllowTools: {}{}\n\n\
+Notes\n\n\
+- Press `a` in a permission prompt to persist an always-allow rule.\n\
+- Or edit your user settings JSON and set `alwaysAllowTools`.\n",
+                app.engine_inputs.cfg.permission_mode,
+                always_allow.len(),
+                if always_allow.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" ({})", always_allow.join(", "))
+                },
+            );
+            app.push_system_message(body);
+            app.status = "permissions".to_string();
         }
         "resume" => {
             if app.in_flight {
@@ -1819,7 +2055,7 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
         role: Role::User,
         text: prompt.clone(),
     });
-    app.rendered.push(RenderedEntry::new(Role::User));
+    app.rendered.push(RenderedEntry::new(Role::User, &app.theme));
 
     // Week 3: make sure the new turn is visible even if the user had scrolled up.
     scroll_to_bottom(app);
@@ -1827,6 +2063,8 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
     app.status = "thinking...".to_string();
     app.in_flight = true;
     app.spinner_idx = 0;
+    app.run_started_at = Some(Instant::now());
+    app.run_stream_chars = 0;
 
     let user_msg = Message::User(UserMessage {
         content: vec![ContentBlock::Text { text: prompt }],
@@ -1887,6 +2125,7 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
 fn handle_query_event(app: &mut App, qev: QueryEvent) {
     match qev {
         QueryEvent::TextDelta(delta) => {
+            let delta_chars = delta.chars().count();
             let idx = match app.active_assistant_idx {
                 Some(idx) => idx,
                 None => {
@@ -1895,7 +2134,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                         text: String::new(),
                     });
                     app.rendered
-                        .push(RenderedEntry::new_streaming(Role::Assistant));
+                        .push(RenderedEntry::new_streaming(Role::Assistant, &app.theme));
                     let idx = app.transcript.len().saturating_sub(1);
                     app.active_assistant_idx = Some(idx);
                     idx
@@ -1907,6 +2146,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             if let Some(cache) = app.rendered.get_mut(idx) {
                 cache.dirty = true;
             }
+            app.run_stream_chars = app.run_stream_chars.saturating_add(delta_chars);
         }
         QueryEvent::PermissionRequest {
             id,
@@ -1941,7 +2181,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 role: Role::Tool,
                 text,
             });
-            app.rendered.push(RenderedEntry::new(Role::Tool));
+            app.rendered.push(RenderedEntry::new(Role::Tool, &app.theme));
             let idx = app.transcript.len().saturating_sub(1);
             app.tool_entry_for_id.insert(id, idx);
             app.status = tool_activity_status(&name, &input);
@@ -1966,7 +2206,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                     role: Role::Tool,
                     text,
                 });
-                app.rendered.push(RenderedEntry::new(Role::Tool));
+                app.rendered.push(RenderedEntry::new(Role::Tool, &app.theme));
             }
             app.status = format!("{name} done");
         }
@@ -1975,6 +2215,15 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.in_flight = false;
             app.active_assistant_idx = None;
             app.permission_prompt = None;
+            let elapsed = app.run_started_at.take().map(|t| t.elapsed());
+            app.last_turn_tokens_per_sec = elapsed.and_then(|d| {
+                let secs = d.as_secs_f64();
+                if secs <= 0.0 {
+                    return None;
+                }
+                Some(result.usage.output_tokens as f64 / secs)
+            });
+            app.run_stream_chars = 0;
             app.record_run_cost(&result);
             app.history = result.history;
             if let Some(idx) = finished_idx {
@@ -2004,14 +2253,28 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 "compaction done",
                 format!("Compaction complete • new session {}", session_id),
             );
+            app.push_toast(
+                ToastLevel::Info,
+                "Compaction complete",
+                Duration::from_secs(3),
+            );
         }
         QueryEvent::CompactionError(err) => {
             app.in_flight = false;
+            app.run_started_at = None;
+            app.run_stream_chars = 0;
             app.status = format!("compact failed: {}", crate::one_line_preview(&err, 160));
             app.push_system_message(format!("error: compaction failed: {err}"));
+            app.push_toast(
+                ToastLevel::Error,
+                "Compaction failed",
+                Duration::from_secs(4),
+            );
         }
         QueryEvent::Error(err) => {
             app.in_flight = false;
+            app.run_started_at = None;
+            app.run_stream_chars = 0;
             app.active_assistant_idx = None;
             app.permission_prompt = None;
 
@@ -2028,7 +2291,8 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 role: Role::System,
                 text: format!("error: {err}"),
             });
-            app.rendered.push(RenderedEntry::new(Role::System));
+            app.rendered.push(RenderedEntry::new(Role::System, &app.theme));
+            app.push_toast(ToastLevel::Error, "Error", Duration::from_secs(4));
         }
     }
 }
@@ -2066,7 +2330,12 @@ fn prompt_history_from_messages(history: &[Message]) -> Vec<String> {
     out
 }
 
-fn prepare_input_render(input: &InputBuffer, width: usize, max_lines: usize) -> PreparedInput {
+fn prepare_input_render(
+    input: &InputBuffer,
+    width: usize,
+    max_lines: usize,
+    theme: &Theme,
+) -> PreparedInput {
     let width = width.max(1);
     let selection = input.selection_range();
     let mut raw_lines: Vec<Vec<Span<'static>>> = Vec::new();
@@ -2077,7 +2346,7 @@ fn prepare_input_render(input: &InputBuffer, width: usize, max_lines: usize) -> 
     let mut cursor_col: usize = 0;
 
     let plain = Style::default();
-    let selected = Style::default().fg(Color::Black).bg(Color::Blue);
+    let selected = theme.selection;
 
     if input.cursor() == 0 {
         cursor_row = 0;
@@ -2164,7 +2433,7 @@ fn prepare_input_render(input: &InputBuffer, width: usize, max_lines: usize) -> 
 }
 
 fn render_status_line(app: &App, spin: &str) -> Line<'static> {
-    let style = Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
+    let style = app.theme.status;
     let vim_label = app.vim.as_ref().map(|vim| match vim.mode() {
         VimMode::Insert => "-- INSERT --",
         VimMode::Normal => "-- NORMAL --",
@@ -2206,12 +2475,47 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
     } else {
         " • Alt+Enter newline • Up/Down history • Ctrl+R search"
     };
-    let vim_prefix = vim_label
-        .map(|mode| format!("{mode} • "))
-        .unwrap_or_default();
+    let mode = if let Some(vim) = app.vim.as_ref() {
+        match vim.mode() {
+            VimMode::Insert => "INSERT",
+            VimMode::Normal => "NORMAL",
+        }
+    } else {
+        "EDIT"
+    };
+
+    let cost_total = match app.total_cost_usd {
+        Some(v) => format!("${v:.4}"),
+        None => "unavailable".to_string(),
+    };
+
+    let tokens_per_sec = if app.in_flight {
+        match app.run_started_at {
+            Some(start) => {
+                let secs = start.elapsed().as_secs_f64();
+                if secs <= 0.0 {
+                    "t/s --".to_string()
+                } else {
+                    // We don't know token counts mid-stream; estimate ~4 chars/token.
+                    let approx_tokens = (app.run_stream_chars as f64) / 4.0;
+                    format!("~{:.1} t/s", approx_tokens / secs)
+                }
+            }
+            None => "t/s --".to_string(),
+        }
+    } else {
+        app.last_turn_tokens_per_sec
+            .map(|v| format!("{v:.1} t/s"))
+            .unwrap_or_else(|| "t/s --".to_string())
+    };
+
+    let metrics = format!(
+        "{mode} • {} • in={} out={} • tot {cost_total} • {tokens_per_sec}",
+        app.model, app.total_input_tokens, app.total_output_tokens,
+    );
 
     Line::from(format!(
-        "{spin} {vim_prefix}{}{scroll_hint}{input_hint}",
+        "{spin} {metrics} • {}{scroll_hint}{input_hint}",
         app.status
     ))
     .style(style)
@@ -2246,6 +2550,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.input,
         size.width.saturating_sub(2) as usize,
         max_input_lines,
+        &app.theme,
     );
     let input_height = estimated_input.visible_line_count.max(1) as u16 + 2 + typeahead_height;
 
@@ -2264,16 +2569,14 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         "claude-rs • session {} • model {} • Ctrl+C to exit",
         app.session_id, app.model
     ))
-    .style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
+    .style(app.theme.header);
     f.render_widget(Paragraph::new(header), chunks[0]);
 
     // Messages
-    let msg_block = Block::default().borders(Borders::ALL).title("Messages");
+    let msg_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(app.theme.border)
+        .title("Messages");
     f.render_widget(&msg_block, chunks[1]);
 
     let inner = msg_block.inner(chunks[1]);
@@ -2304,7 +2607,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         "Input • / for commands • Alt+Enter newline • Up/Down history"
     };
-    let input_block = Block::default().borders(Borders::ALL).title(input_title);
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(app.theme.border)
+        .title(input_title);
     let input_inner = input_block.inner(chunks[2]);
 
     let typeahead_area_height = typeahead_height.min(input_inner.height.saturating_sub(1));
@@ -2333,6 +2639,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         &app.input,
         input_area.width.max(1) as usize,
         input_area.height.max(1) as usize,
+        &app.theme,
     );
     f.render_widget(&input_block, chunks[2]);
     f.render_widget(Paragraph::new(input_layout.text.clone()), input_area);
@@ -2341,7 +2648,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         f.render_widget(ratatui::widgets::Clear, typeahead_area);
 
         // A top border line to visually separate suggestions from input text.
-        let list_block = Block::default().borders(Borders::TOP).title("Commands");
+        let list_block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(app.theme.border)
+            .title("Commands");
         let list_inner = list_block.inner(typeahead_area);
         f.render_widget(&list_block, typeahead_area);
 
@@ -2364,7 +2674,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
                     Span::styled(cmd.description, Style::default().fg(Color::Gray)),
                 ]));
                 if idx == app.typeahead_selected {
-                    item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+                    item = item.style(app.theme.selection);
                 }
                 item
             })
@@ -2401,6 +2711,11 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Some(dialog) = &app.dialog {
         render_dialog_modal(f, app, dialog, size);
     }
+
+    // Week 10: transient notification toasts.
+    if app.permission_prompt.is_none() && app.dialog.is_none() {
+        render_toasts(f, app, size);
+    }
 }
 fn centered_rect(
     percent_x: u16,
@@ -2429,6 +2744,65 @@ fn centered_rect(
         .split(popup_layout[1]);
 
     horizontal[1]
+}
+
+fn render_toasts(f: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    if app.toasts.is_empty() {
+        return;
+    }
+
+    // Show up to 3 most-recent toasts. Each uses 3 rows (border + 1 line).
+    let max_visible = ((area.height.saturating_sub(1)) / 3).max(1) as usize;
+    let max_visible = max_visible.min(3);
+
+    let toasts = app
+        .toasts
+        .iter()
+        .rev()
+        .take(max_visible)
+        .collect::<Vec<_>>();
+
+    // Render oldest-to-newest top-down.
+    let toasts = toasts.into_iter().rev().collect::<Vec<_>>();
+
+    let width = area.width.min(60).max(20);
+    let x = area.x + area.width.saturating_sub(width);
+    let mut y = area.y.saturating_add(1);
+
+    for toast in toasts {
+        if y.saturating_add(3) > area.y.saturating_add(area.height) {
+            break;
+        }
+
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width,
+            height: 3,
+        };
+        y = y.saturating_add(3);
+
+        let style = match toast.level {
+            ToastLevel::Info => app.theme.toast_info,
+            ToastLevel::Warn => app.theme.toast_warn,
+            ToastLevel::Error => app.theme.toast_error,
+        };
+
+        // Note: the inner space is (width - 2). Keep it one-line to avoid
+        // obscuring too much of the transcript.
+        let msg = crate::one_line_preview(&toast.message, width.saturating_sub(2) as usize);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(app.theme.border)
+            .style(style);
+
+        f.render_widget(ratatui::widgets::Clear, rect);
+        f.render_widget(Paragraph::new(msg).block(block).style(style), rect);
+    }
 }
 
 fn render_permission_modal(
@@ -2983,6 +3357,29 @@ fn persist_tui_onboarding_seen(settings_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn persist_tui_theme(settings_path: &Path, theme_name: &str) -> anyhow::Result<()> {
+    let theme_name = theme_name.trim();
+    if theme_name.is_empty() {
+        anyhow::bail!("theme name is empty");
+    }
+
+    let _lock = crate::lock_settings_path(settings_path)?;
+    let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
+    let Some(obj) = root.as_object_mut() else {
+        anyhow::bail!(
+            "settings root must be a JSON object: {}",
+            settings_path.display()
+        );
+    };
+
+    obj.insert(
+        "tuiTheme".to_string(),
+        serde_json::Value::String(theme_name.to_string()),
+    );
+    crate::save_settings_json(settings_path, &root)?;
+    Ok(())
+}
+
 fn render_dialog_modal(
     f: &mut ratatui::Frame<'_>,
     app: &App,
@@ -2993,7 +3390,7 @@ fn render_dialog_modal(
         DialogState::Onboarding(_) => render_onboarding_dialog(f, app, area),
         DialogState::ModelPicker(dialog) => render_model_picker_dialog(f, app, dialog, area),
         DialogState::SessionResume(dialog) => render_session_resume_dialog(f, app, dialog, area),
-        DialogState::TranscriptSearch(dialog) => render_transcript_search_dialog(f, dialog, area),
+        DialogState::TranscriptSearch(dialog) => render_transcript_search_dialog(f, app, dialog, area),
     }
 }
 
@@ -3079,7 +3476,7 @@ fn render_model_picker_dialog(
             }
             let mut item = ListItem::new(Line::from(spans));
             if idx == dialog.selected {
-                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+                item = item.style(app.theme.selection);
             }
             item
         })
@@ -3156,7 +3553,7 @@ fn render_session_resume_dialog(
                 .unwrap_or_else(|| session.path.display().to_string());
             let mut item = ListItem::new(Line::from(format!("{line}  —  {preview}")));
             if idx == dialog.selected {
-                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+                item = item.style(app.theme.selection);
             }
             item
         })
@@ -3177,6 +3574,7 @@ fn render_session_resume_dialog(
 
 fn render_transcript_search_dialog(
     f: &mut ratatui::Frame<'_>,
+    app: &App,
     dialog: &TranscriptSearchDialog,
     area: ratatui::layout::Rect,
 ) {
@@ -3224,7 +3622,7 @@ fn render_transcript_search_dialog(
                 hit.preview
             )));
             if idx == dialog.selected {
-                item = item.style(Style::default().fg(Color::Black).bg(Color::Blue));
+                item = item.style(app.theme.selection);
             }
             item
         })

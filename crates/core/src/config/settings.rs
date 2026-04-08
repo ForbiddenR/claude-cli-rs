@@ -105,6 +105,14 @@ pub struct Settings {
 
     #[serde(
         default,
+        rename = "tuiTheme",
+        alias = "tui_theme",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tui_theme: Option<String>,
+
+    #[serde(
+        default,
         rename = "tuiOnboardingSeen",
         alias = "tui_onboarding_seen",
         skip_serializing_if = "Option::is_none"
@@ -168,6 +176,9 @@ impl Settings {
                 for (k, v) in map {
                     merged_tui_keybindings.insert(k.clone(), v.clone());
                 }
+            }
+            if layer.tui_theme.is_some() {
+                out.tui_theme = layer.tui_theme.clone();
             }
             if layer.tui_onboarding_seen.is_some() {
                 out.tui_onboarding_seen = layer.tui_onboarding_seen;
