@@ -157,6 +157,8 @@ struct App {
     /// Prefix-sum of entry start lines. `line_offsets[i]` is the first line of entry `i`,
     /// and the final element is the total line count.
     line_offsets: Vec<usize>,
+    /// When set, line offsets must be recomputed starting at this entry index.
+    line_offsets_dirty_from: Option<usize>,
 
     session_id: SessionId,
     session_path: PathBuf,
@@ -475,6 +477,8 @@ impl App {
         let role = entry.role;
         self.transcript.push(entry);
         self.rendered.push(RenderedEntry::new(role, &self.theme));
+        let idx = self.transcript.len().saturating_sub(1);
+        self.mark_line_offsets_dirty_from(idx);
         self.next_transcript_rev();
     }
 
@@ -512,6 +516,13 @@ impl App {
         }
     }
 
+    fn mark_line_offsets_dirty_from(&mut self, idx: usize) {
+        match self.line_offsets_dirty_from {
+            Some(existing) => self.line_offsets_dirty_from = Some(existing.min(idx)),
+            None => self.line_offsets_dirty_from = Some(idx),
+        }
+    }
+
     fn ensure_rendered(&mut self, width: usize) {
         let width = width.max(1);
 
@@ -523,17 +534,25 @@ impl App {
                     stream.reset();
                 }
             }
+            // Width changes can change line wrapping across the entire transcript.
+            self.mark_line_offsets_dirty_from(0);
         }
 
         // Defensive: keep caches aligned even if a future edit forgets to push/pop both.
+        let start_len = self.rendered.len();
         while self.rendered.len() < self.transcript.len() {
             let role = self.transcript[self.rendered.len()].role;
             self.rendered.push(RenderedEntry::new(role, &self.theme));
         }
+        if self.rendered.len() > start_len {
+            self.mark_line_offsets_dirty_from(start_len);
+        }
         if self.rendered.len() > self.transcript.len() {
             self.rendered.truncate(self.transcript.len());
+            self.mark_line_offsets_dirty_from(0);
         }
 
+        let mut line_offsets_dirty_from = self.line_offsets_dirty_from;
         for (idx, cache) in self.rendered.iter_mut().enumerate() {
             if !cache.dirty {
                 continue;
@@ -541,6 +560,7 @@ impl App {
             let Some(entry) = self.transcript.get(idx) else {
                 continue;
             };
+            let before = cache.body.line_count();
             match &mut cache.body {
                 RenderedBody::Static(lines) => {
                     *lines = self.md.render(&entry.text, width);
@@ -550,23 +570,55 @@ impl App {
                 }
             }
             cache.dirty = false;
+            let after = cache.body.line_count();
+            if before != after {
+                line_offsets_dirty_from = Some(match line_offsets_dirty_from {
+                    Some(existing) => existing.min(idx),
+                    None => idx,
+                });
+            }
         }
+        self.line_offsets_dirty_from = line_offsets_dirty_from;
     }
 
-    fn recompute_line_offsets(&mut self) {
-        self.line_offsets.clear();
-        self.line_offsets
-            .reserve(self.rendered.len().saturating_add(1));
-
-        let mut acc: usize = 0;
-        for entry in &self.rendered {
-            self.line_offsets.push(acc);
-            // header + body + separator blank line
-            acc = acc.saturating_add(1);
-            acc = acc.saturating_add(entry.body.line_count());
-            acc = acc.saturating_add(1);
+    fn ensure_line_offsets(&mut self) {
+        let entries = self.rendered.len();
+        if entries == 0 {
+            self.line_offsets.clear();
+            self.line_offsets_dirty_from = None;
+            return;
         }
-        self.line_offsets.push(acc);
+
+        let covered_entries = self.line_offsets.len().saturating_sub(1);
+        if covered_entries != entries {
+            // Grow/shrink while keeping any already-correct prefix sums.
+            self.line_offsets.resize(entries.saturating_add(1), 0);
+
+            // If we grew, we can recompute only from the first newly-added entry.
+            // If we shrank, rebuilding from the top is simplest and rare.
+            if covered_entries < entries {
+                self.mark_line_offsets_dirty_from(covered_entries);
+            } else {
+                self.mark_line_offsets_dirty_from(0);
+            }
+        }
+
+        let Some(from) = self.line_offsets_dirty_from.take() else {
+            return;
+        };
+        let from = from.min(entries.saturating_sub(1));
+
+        if from == 0 {
+            self.line_offsets[0] = 0;
+        }
+
+        for i in from..entries {
+            let start = self.line_offsets[i];
+            let height = 1usize
+                .saturating_add(self.rendered[i].body.line_count())
+                .saturating_add(1);
+            self.line_offsets[i.saturating_add(1)] = start.saturating_add(height);
+        }
     }
 
     fn total_rendered_lines(&self) -> usize {
@@ -585,6 +637,7 @@ impl App {
             return;
         };
 
+        let before = cache.body.line_count();
         let body = std::mem::replace(&mut cache.body, RenderedBody::Static(Vec::new()));
         match body {
             RenderedBody::Streaming(stream) => {
@@ -596,6 +649,10 @@ impl App {
             }
         }
         cache.dirty = false;
+        let after = cache.body.line_count();
+        if before != after {
+            self.mark_line_offsets_dirty_from(idx);
+        }
     }
 
     fn current_key_context(&self) -> KeyContext {
@@ -765,6 +822,8 @@ impl App {
         self.dismiss_typeahead();
         self.scroll_top = 0;
         self.scroll_follow = true;
+        self.line_offsets.clear();
+        self.line_offsets_dirty_from = Some(0);
         self.next_transcript_rev();
         self.push_system_message("Started a new session. Previous transcript remains on disk.");
         self.status = "session cleared".to_string();
@@ -840,6 +899,8 @@ impl App {
         self.render_width = 0;
         self.scroll_top = 0;
         self.scroll_follow = true;
+        self.line_offsets.clear();
+        self.line_offsets_dirty_from = Some(0);
         self.transcript_rev = self.transcript_rev.saturating_add(1);
         self.push_system_message(note);
         self.status = status.into();
@@ -1222,6 +1283,7 @@ pub async fn run_tui(
         scroll_follow: true,
         last_msg_view_height: 0,
         line_offsets: Vec::new(),
+        line_offsets_dirty_from: Some(0),
         session_id,
         session_path,
         model: model.clone(),
@@ -1460,8 +1522,10 @@ async fn handle_term_event(
                                     );
                                 }
                                 Ok(false) => {
-                                    app.status =
-                                        format!("always allow {} (already saved)", prompt.tool_name);
+                                    app.status = format!(
+                                        "always allow {} (already saved)",
+                                        prompt.tool_name
+                                    );
                                     app.push_toast(
                                         ToastLevel::Info,
                                         format!("Always allow already set: {}", prompt.tool_name),
@@ -1893,7 +1957,11 @@ async fn execute_slash_command(
                     app.model = next.clone();
                     app.rebuild_engine()?;
                     app.push_system_message(format!("Model updated to `{next}`"));
-                    app.push_toast(ToastLevel::Info, format!("Model: {next}"), Duration::from_secs(3));
+                    app.push_toast(
+                        ToastLevel::Info,
+                        format!("Model: {next}"),
+                        Duration::from_secs(3),
+                    );
                     app.status = format!("model {}", app.model);
                 }
             }
@@ -2040,10 +2108,7 @@ async fn execute_slash_command(
                 }
                 app.push_toast(
                     ToastLevel::Info,
-                    format!(
-                        "Thinking: {}",
-                        if next { "shown" } else { "hidden" }
-                    ),
+                    format!("Thinking: {}", if next { "shown" } else { "hidden" }),
                     Duration::from_secs(3),
                 );
             }
@@ -2082,10 +2147,7 @@ async fn execute_slash_command(
                 }
                 app.push_toast(
                     ToastLevel::Info,
-                    format!(
-                        "Condensed: {}",
-                        if next { "on" } else { "off" }
-                    ),
+                    format!("Condensed: {}", if next { "on" } else { "off" }),
                     Duration::from_secs(3),
                 );
             }
@@ -2123,7 +2185,11 @@ Current status: feature stub only.",
                 app.status = "vim on".to_string();
             } else {
                 if app.vim.take().is_some() {
-                    app.push_toast(ToastLevel::Info, "Vim mode disabled", Duration::from_secs(3));
+                    app.push_toast(
+                        ToastLevel::Info,
+                        "Vim mode disabled",
+                        Duration::from_secs(3),
+                    );
                 }
                 app.status = "vim off".to_string();
             }
@@ -2355,8 +2421,7 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
                         let _ = tx_for_deltas.send(QueryEvent::TextDelta(text.to_string()));
                     }
                     if let Some(thinking) = crate::extract_thinking_delta(event) {
-                        let _ =
-                            tx_for_deltas.send(QueryEvent::ThinkingDelta(thinking.to_string()));
+                        let _ = tx_for_deltas.send(QueryEvent::ThinkingDelta(thinking.to_string()));
                     }
                     Ok(())
                 },
@@ -2396,7 +2461,8 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             let idx = match app.active_assistant_idx {
                 Some(idx) => idx,
                 None => {
-                    app.transcript.push(ChatEntry::plain(Role::Assistant, String::new()));
+                    app.transcript
+                        .push(ChatEntry::plain(Role::Assistant, String::new()));
                     app.rendered
                         .push(RenderedEntry::new_streaming(Role::Assistant, &app.theme));
                     let idx = app.transcript.len().saturating_sub(1);
@@ -2546,7 +2612,8 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 }
                 app.next_transcript_rev();
             } else {
-                let entry = ChatEntry::tool(name.clone(), input.clone(), state, app.display_prefs());
+                let entry =
+                    ChatEntry::tool(name.clone(), input.clone(), state, app.display_prefs());
                 app.append_entry(entry);
             }
             app.status = format!("{name} done");
@@ -2982,7 +3049,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
 
     app.last_msg_view_height = inner_h;
     app.ensure_rendered(inner_w);
-    app.recompute_line_offsets();
+    app.ensure_line_offsets();
     let total_lines = app.total_rendered_lines();
     let max_scroll = total_lines.saturating_sub(inner_h);
     if app.scroll_follow {
@@ -3030,14 +3097,19 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         )
     };
 
-    let input_layout = prepare_input_render(
+    let PreparedInput {
+        text: input_text,
+        cursor_row,
+        cursor_col,
+        visible_line_count: _,
+    } = prepare_input_render(
         &app.input,
         input_area.width.max(1) as usize,
         input_area.height.max(1) as usize,
         &app.theme,
     );
     f.render_widget(&input_block, chunks[2]);
-    f.render_widget(Paragraph::new(input_layout.text.clone()), input_area);
+    f.render_widget(Paragraph::new(input_text), input_area);
 
     if typeahead_area.height > 0 && !typeahead.is_empty() {
         f.render_widget(ratatui::widgets::Clear, typeahead_area);
@@ -3079,8 +3151,8 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         f.render_widget(list, list_inner);
     }
 
-    let cursor_x = input_area.x + input_layout.cursor_col as u16;
-    let cursor_y = input_area.y + input_layout.cursor_row as u16;
+    let cursor_x = input_area.x + cursor_col as u16;
+    let cursor_y = input_area.y + cursor_row as u16;
     if app.permission_prompt.is_none() && app.dialog.is_none() {
         f.set_cursor(cursor_x, cursor_y);
     }
@@ -3791,10 +3863,7 @@ fn persist_tui_show_thinking(settings_path: &Path, show: bool) -> anyhow::Result
         );
     };
 
-    obj.insert(
-        "tuiShowThinking".to_string(),
-        serde_json::Value::Bool(show),
-    );
+    obj.insert("tuiShowThinking".to_string(), serde_json::Value::Bool(show));
     crate::save_settings_json(settings_path, &root)?;
     Ok(())
 }
@@ -3827,7 +3896,9 @@ fn render_dialog_modal(
         DialogState::Onboarding(_) => render_onboarding_dialog(f, app, area),
         DialogState::ModelPicker(dialog) => render_model_picker_dialog(f, app, dialog, area),
         DialogState::SessionResume(dialog) => render_session_resume_dialog(f, app, dialog, area),
-        DialogState::TranscriptSearch(dialog) => render_transcript_search_dialog(f, app, dialog, area),
+        DialogState::TranscriptSearch(dialog) => {
+            render_transcript_search_dialog(f, app, dialog, area)
+        }
     }
 }
 
@@ -4100,9 +4171,7 @@ fn render_thinking_entry(entry: &ThinkingEntry, show_thinking: bool) -> String {
         }
     } else {
         let approx_tokens = (entry.thinking.chars().count() / 4).max(1);
-        format!(
-            "_Thinking hidden._ Use `/thinking on` to expand it. (~{approx_tokens} tokens)"
-        )
+        format!("_Thinking hidden._ Use `/thinking on` to expand it. (~{approx_tokens} tokens)")
     }
 }
 
@@ -4197,7 +4266,10 @@ fn transcript_from_history(history: &[Message], prefs: DisplayPrefs) -> Vec<Chat
                             is_error,
                         } => {
                             if !text_buf.trim().is_empty() {
-                                out.push(ChatEntry::plain(Role::User, std::mem::take(&mut text_buf)));
+                                out.push(ChatEntry::plain(
+                                    Role::User,
+                                    std::mem::take(&mut text_buf),
+                                ));
                             }
 
                             let (tool_name, tool_input) = tool_input_for_id
@@ -4962,6 +5034,12 @@ fn write_session_meta_silent(
 mod tests {
     use super::*;
     use claude_core::types::message::AssistantMessage;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     #[test]
     fn thinking_entry_can_toggle_visibility() {
@@ -5047,5 +5125,404 @@ mod tests {
         assert_eq!(transcript[1].role, Role::Tool);
         assert!(transcript[1].text.contains("Result summary:"));
         assert!(transcript[1].text.contains("research issue"));
+    }
+
+    fn buffer_to_trimmed_string(buf: &Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                line.push_str(buf.get(x, y).symbol());
+            }
+            out.push_str(line.trim_end_matches(' '));
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_app_snapshot(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| render(f, app)).expect("draw");
+        buffer_to_trimmed_string(terminal.backend().buffer())
+    }
+
+    fn build_test_app(cwd: &Path) -> App {
+        let session_id: SessionId = "00000000-0000-0000-0000-000000000000"
+            .parse()
+            .expect("session id");
+        let session_path = cwd.join("session.jsonl");
+        let model = "claude-sonnet-4-6".to_string();
+
+        let theme = Theme::new(ThemeName::Dark);
+        let md = MarkdownRenderer::new();
+        let history: Vec<Message> = Vec::new();
+
+        let show_thinking = false;
+        let condensed = false;
+        let prefs = DisplayPrefs {
+            show_thinking,
+            condensed,
+        };
+
+        let mut transcript = transcript_from_history(&history, prefs);
+        if transcript.is_empty() {
+            transcript.push(ChatEntry::plain(
+                Role::System,
+                "Ctrl+C to exit. Type a prompt and press Enter.",
+            ));
+        }
+        let rendered = transcript
+            .iter()
+            .map(|e| RenderedEntry::new(e.role, &theme))
+            .collect::<Vec<_>>();
+
+        let client = claude_services::api::AnthropicClient::new(Some("http://127.0.0.1".into()));
+        let auth = AuthMode::ApiKey("test-key".to_string());
+
+        let engine_inputs = EngineInputs {
+            max_tokens: 64,
+            cfg: claude_query::QueryEngineConfig {
+                cwd: cwd.to_path_buf(),
+                bare: true,
+                add_dirs: Vec::new(),
+                system_prompt: None,
+                append_system_prompt: None,
+                json_schema: None,
+                max_turns: 2,
+                max_budget_usd: None,
+                permission_mode: PermissionMode::Default,
+                base_tools: Vec::new(),
+                allowed_tools: Vec::new(),
+                disallowed_tools: vec!["AskUserQuestion".to_string()],
+                always_allow_tools: Vec::new(),
+                mcp_servers: HashMap::new(),
+                agent_depth: 0,
+                max_agent_depth: 2,
+            },
+        };
+
+        let engine = std::sync::Arc::new(
+            claude_query::QueryEngine::new(
+                client.clone(),
+                auth.clone(),
+                model.clone(),
+                engine_inputs.max_tokens,
+                engine_inputs.cfg.clone(),
+            )
+            .expect("engine"),
+        );
+
+        App {
+            input: InputBuffer::new(),
+            prompt_history: PromptHistory::new(Vec::new()),
+            reverse_history_search: None,
+            vim: None,
+            keymap: KeybindingResolver::new(Duration::from_millis(900)),
+            dialog: None,
+            typeahead_query: None,
+            typeahead_selected: 0,
+            typeahead_suppressed_text: None,
+            status: "ready".to_string(),
+            theme: theme.clone(),
+            toasts: Vec::new(),
+            spinner_idx: 0,
+            in_flight: false,
+            active_assistant_idx: None,
+            active_thinking_idx: None,
+            run_started_at: None,
+            run_stream_chars: 0,
+            last_turn_tokens_per_sec: None,
+            show_thinking,
+            condensed,
+            transcript_rev: 1,
+            transcript,
+            rendered,
+            render_width: 0,
+            md,
+            history,
+            tool_entry_for_id: HashMap::new(),
+            permission_prompt: None,
+            always_allow_tools: Arc::new(Mutex::new(HashSet::new())),
+            scroll_top: 0,
+            scroll_follow: true,
+            last_msg_view_height: 0,
+            line_offsets: Vec::new(),
+            line_offsets_dirty_from: Some(0),
+            session_id,
+            session_path,
+            model,
+            cwd: cwd.to_path_buf(),
+            user_settings_path: cwd.join("settings.json"),
+            client,
+            auth,
+            engine_inputs,
+            engine,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cost_usd: Some(0.0),
+            last_turn_input_tokens: 0,
+            last_turn_output_tokens: 0,
+            last_turn_cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_renders_basic_shell() {
+        let work = tempfile::tempdir().expect("temp work dir");
+        let mut app = build_test_app(work.path());
+        let snap = render_app_snapshot(&mut app, 64, 18);
+        let expected = r#"claude-rs • session 00000000-0000-0000-0000-000000000000 • model
+┌Messages──────────────────────────────────────────────────────┐
+│System                                                        │
+│Ctrl+C to exit. Type a prompt and press Enter.                │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+┌Input • / for commands • Alt+Enter newline • Up/Down history──┐
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+  EDIT • claude-sonnet-4-6 • in=0 out=0 • tot $0.0000 • t/s -- •
+"#;
+        assert_eq!(snap, expected);
+    }
+
+    struct ExpectedRequest {
+        must_contain: Option<String>,
+        sse_body: String,
+    }
+
+    fn spawn_mock_sse_server_sequence(
+        responses: Vec<ExpectedRequest>,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("server addr");
+
+        let handle = thread::spawn(move || {
+            for (idx, exp) in responses.into_iter().enumerate() {
+                let (mut stream, _peer) = listener.accept().expect("accept");
+                let _ = stream.set_read_timeout(Some(StdDuration::from_secs(10)));
+                let _ = stream.set_write_timeout(Some(StdDuration::from_secs(10)));
+
+                // Read until the end of headers.
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut tmp).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.len() > 2_000_000 {
+                        break;
+                    }
+                }
+
+                let header_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(buf.len());
+
+                let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                let mut lines = header_str.split("\r\n");
+                let request_line = lines.next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+
+                let mut content_length: usize = 0;
+                for line in lines {
+                    if line.is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse::<usize>().unwrap_or(0);
+                    }
+                }
+
+                // Read request body so we can assert on it.
+                let mut body: Vec<u8> = Vec::new();
+                let already_body = buf.len().saturating_sub(header_end);
+                if already_body > 0 {
+                    body.extend_from_slice(&buf[header_end..]);
+                }
+                let mut remaining = content_length.saturating_sub(already_body);
+                while remaining > 0 {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    let take = remaining.min(n);
+                    body.extend_from_slice(&tmp[..take]);
+                    remaining = remaining.saturating_sub(take);
+                }
+
+                if let Some(needle) = exp.must_contain.as_deref() {
+                    let body_str = String::from_utf8_lossy(&body);
+                    assert!(
+                        body_str.contains(needle),
+                        "request {idx} body did not contain {needle}\nbody={body_str}"
+                    );
+                }
+
+                let (status_line, body) = if method == "POST" && path == "/v1/messages" {
+                    ("HTTP/1.1 200 OK\r\n", exp.sse_body)
+                } else {
+                    ("HTTP/1.1 404 Not Found\r\n", "not found".to_string())
+                };
+
+                let resp = format!(
+                    "{status_line}Content-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.as_bytes().len()
+                );
+                stream.write_all(resp.as_bytes()).expect("write response");
+                stream.flush().ok();
+            }
+        });
+
+        (addr, handle)
+    }
+
+    fn sse_events(events: Vec<serde_json::Value>) -> String {
+        let mut body = String::new();
+        for ev in events {
+            body.push_str("data: ");
+            body.push_str(&ev.to_string());
+            body.push('\n');
+            body.push('\n');
+        }
+        body
+    }
+
+    fn mock_sse_ok_text(text: &str) -> String {
+        let events = vec![
+            serde_json::json!({
+              "type": "message_start",
+              "message": { "model": "claude-sonnet-4-6", "usage": { "input_tokens": 1, "output_tokens": 0 } }
+            }),
+            serde_json::json!({
+              "type": "content_block_start",
+              "index": 0,
+              "content_block": { "type": "text", "text": "" }
+            }),
+            serde_json::json!({
+              "type": "content_block_delta",
+              "index": 0,
+              "delta": { "type": "text_delta", "text": text }
+            }),
+            serde_json::json!({
+              "type": "message_delta",
+              "delta": { "stop_reason": "end_turn" },
+              "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+            serde_json::json!({ "type": "message_stop" }),
+        ];
+        sse_events(events)
+    }
+
+    fn mock_sse_tool_use_write(file_path: &str, content: &str) -> String {
+        let events = vec![
+            serde_json::json!({
+              "type": "message_start",
+              "message": { "model": "claude-sonnet-4-6", "usage": { "input_tokens": 1, "output_tokens": 0 } }
+            }),
+            serde_json::json!({
+              "type": "content_block_start",
+              "index": 0,
+              "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "Write",
+                "input": {
+                  "file_path": file_path,
+                  "content": content
+                }
+              }
+            }),
+            serde_json::json!({
+              "type": "message_delta",
+              "delta": { "stop_reason": "tool_use" },
+              "usage": { "input_tokens": 1, "output_tokens": 1 }
+            }),
+            serde_json::json!({ "type": "message_stop" }),
+        ];
+        sse_events(events)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn integration_full_tui_flow_with_permission_and_tool() {
+        let work = tempfile::tempdir().expect("temp work dir");
+        let file_path = work.path().join("hello.txt");
+
+        let sse1 = mock_sse_tool_use_write(&file_path.to_string_lossy(), "hi from tool");
+        let sse2 = mock_sse_ok_text("All done");
+
+        let (addr, handle) = spawn_mock_sse_server_sequence(vec![
+            ExpectedRequest {
+                must_contain: None,
+                sse_body: sse1,
+            },
+            ExpectedRequest {
+                must_contain: Some("\"tool_result\"".to_string()),
+                sse_body: sse2,
+            },
+        ]);
+        let base_url = format!("http://{addr}");
+
+        // Build an app that targets the mock server.
+        let mut app = build_test_app(work.path());
+        app.client = claude_services::api::AnthropicClient::new(Some(base_url));
+        app.engine = std::sync::Arc::new(
+            claude_query::QueryEngine::new(
+                app.client.clone(),
+                app.auth.clone(),
+                app.model.clone(),
+                app.engine_inputs.max_tokens,
+                app.engine_inputs.cfg.clone(),
+            )
+            .expect("engine"),
+        );
+
+        app.input.insert_str("Write a file");
+        let (tx, mut rx) = mpsc::unbounded_channel::<QueryEvent>();
+        submit_prompt(&mut app, tx.clone()).expect("submit");
+
+        // Drive the event loop until completion, auto-allowing any permission prompt.
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("event");
+            let done = matches!(ev, QueryEvent::Finished(_) | QueryEvent::Error(_));
+            handle_query_event(&mut app, ev);
+
+            if app.permission_prompt.is_some() {
+                let key =
+                    crossterm::event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty());
+                handle_term_event(&mut app, Event::Key(key), tx.clone())
+                    .await
+                    .expect("allow");
+            }
+
+            if done {
+                break;
+            }
+        }
+
+        let written = std::fs::read_to_string(&file_path).expect("read written file");
+        assert_eq!(written, "hi from tool");
+        assert!(app.transcript.iter().any(|e| e.text.contains("All done")));
+        assert!(app.transcript.iter().any(|e| e.text.contains("Write")));
+
+        handle.join().expect("server thread");
     }
 }

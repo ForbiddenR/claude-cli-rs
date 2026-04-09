@@ -106,10 +106,18 @@ impl Theme {
                     .add_modifier(Modifier::DIM),
                 border: Style::default().fg(Color::Rgb(120, 120, 120)),
                 selection: Style::default().fg(Color::White).bg(Color::Blue),
-                role_user: Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                role_assistant: Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-                role_tool: Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                role_system: Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                role_user: Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                role_assistant: Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                role_tool: Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                role_system: Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
                 role_thinking: Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                 toast_info: Style::default()
                     .fg(Color::White)
