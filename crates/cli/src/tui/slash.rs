@@ -27,6 +27,21 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         usage: "/status",
     },
     SlashCommandDef {
+        name: "thinking",
+        description: "Show or hide assistant thinking blocks",
+        usage: "/thinking [on|off]",
+    },
+    SlashCommandDef {
+        name: "condensed",
+        description: "Toggle condensed transcript mode for tool results",
+        usage: "/condensed [on|off]",
+    },
+    SlashCommandDef {
+        name: "voice",
+        description: "Show voice-input availability (feature-gated)",
+        usage: "/voice",
+    },
+    SlashCommandDef {
         name: "vim",
         description: "Toggle vim-style input editing",
         usage: "/vim [on|off]",

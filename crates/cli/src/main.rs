@@ -1049,6 +1049,19 @@ fn extract_text_delta(event: &serde_json::Value) -> Option<&str> {
     delta.get("text")?.as_str()
 }
 
+fn extract_thinking_delta(event: &serde_json::Value) -> Option<&str> {
+    let ty = event.get("type")?.as_str()?;
+    if ty != "content_block_delta" {
+        return None;
+    }
+    let delta = event.get("delta")?;
+    let delta_ty = delta.get("type")?.as_str()?;
+    if delta_ty != "thinking_delta" {
+        return None;
+    }
+    delta.get("thinking")?.as_str()
+}
+
 fn load_system_prompt_override(args: &Args) -> anyhow::Result<Option<String>> {
     if args.system_prompt.is_some() {
         return Ok(args.system_prompt.clone());

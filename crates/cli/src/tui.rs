@@ -52,12 +52,48 @@ enum Role {
     Assistant,
     Tool,
     System,
+    Thinking,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayPrefs {
+    show_thinking: bool,
+    condensed: bool,
 }
 
 #[derive(Debug, Clone)]
 struct ChatEntry {
     role: Role,
+    kind: ChatEntryKind,
     text: String,
+}
+
+#[derive(Debug, Clone)]
+enum ChatEntryKind {
+    Plain,
+    Tool(ToolEntry),
+    Thinking(ThinkingEntry),
+}
+
+#[derive(Debug, Clone)]
+struct ToolEntry {
+    name: String,
+    input: serde_json::Value,
+    state: ToolEntryState,
+}
+
+#[derive(Debug, Clone)]
+enum ToolEntryState {
+    Running,
+    Result {
+        result: serde_json::Value,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ThinkingEntry {
+    thinking: String,
 }
 
 struct RenderedEntry {
@@ -87,9 +123,17 @@ struct App {
     spinner_idx: usize,
     in_flight: bool,
     active_assistant_idx: Option<usize>,
+    active_thinking_idx: Option<usize>,
     run_started_at: Option<Instant>,
     run_stream_chars: usize,
     last_turn_tokens_per_sec: Option<f64>,
+
+    // Week 11: transcript display toggles.
+    show_thinking: bool,
+    condensed: bool,
+
+    /// Bumps whenever transcript entries are added/removed or their displayed text changes.
+    transcript_rev: u64,
 
     transcript: Vec<ChatEntry>,
     rendered: Vec<RenderedEntry>,
@@ -198,6 +242,7 @@ struct TranscriptSearchDialog {
     hits: Vec<SearchHit>,
     last_query: String,
     last_transcript_len: usize,
+    last_transcript_rev: u64,
 }
 
 #[derive(Clone)]
@@ -209,6 +254,7 @@ struct EngineInputs {
 #[derive(Debug)]
 enum QueryEvent {
     TextDelta(String),
+    ThinkingDelta(String),
     ToolUseStart {
         id: String,
         name: String,
@@ -358,7 +404,114 @@ impl RenderedBody {
     }
 }
 
+impl ChatEntry {
+    fn plain(role: Role, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            kind: ChatEntryKind::Plain,
+            text: text.into(),
+        }
+    }
+
+    fn tool(
+        name: impl Into<String>,
+        input: serde_json::Value,
+        state: ToolEntryState,
+        prefs: DisplayPrefs,
+    ) -> Self {
+        let tool = ToolEntry {
+            name: name.into(),
+            input,
+            state,
+        };
+        let text = render_tool_entry(&tool, prefs.condensed);
+        Self {
+            role: Role::Tool,
+            kind: ChatEntryKind::Tool(tool),
+            text,
+        }
+    }
+
+    fn thinking(thinking: impl Into<String>, prefs: DisplayPrefs) -> Self {
+        let entry = ThinkingEntry {
+            thinking: thinking.into(),
+        };
+        let text = render_thinking_entry(&entry, prefs.show_thinking);
+        Self {
+            role: Role::Thinking,
+            kind: ChatEntryKind::Thinking(entry),
+            text,
+        }
+    }
+
+    fn refresh_display(&mut self, prefs: DisplayPrefs) -> bool {
+        let next = match &self.kind {
+            ChatEntryKind::Plain => return false,
+            ChatEntryKind::Tool(tool) => render_tool_entry(tool, prefs.condensed),
+            ChatEntryKind::Thinking(entry) => render_thinking_entry(entry, prefs.show_thinking),
+        };
+
+        if next != self.text {
+            self.text = next;
+            return true;
+        }
+        false
+    }
+}
+
 impl App {
+    fn display_prefs(&self) -> DisplayPrefs {
+        DisplayPrefs {
+            show_thinking: self.show_thinking,
+            condensed: self.condensed,
+        }
+    }
+
+    fn next_transcript_rev(&mut self) {
+        self.transcript_rev = self.transcript_rev.saturating_add(1);
+    }
+
+    fn append_entry(&mut self, entry: ChatEntry) {
+        let role = entry.role;
+        self.transcript.push(entry);
+        self.rendered.push(RenderedEntry::new(role, &self.theme));
+        self.next_transcript_rev();
+    }
+
+    fn refresh_entry(&mut self, idx: usize) {
+        if idx >= self.transcript.len() {
+            return;
+        }
+        let prefs = self.display_prefs();
+        if let Some(entry) = self.transcript.get_mut(idx) {
+            let changed = entry.refresh_display(prefs);
+            if changed {
+                if let Some(cache) = self.rendered.get_mut(idx) {
+                    cache.dirty = true;
+                    cache.header = role_header(&self.theme, entry.role);
+                }
+                self.next_transcript_rev();
+            }
+        }
+    }
+
+    fn refresh_display_prefs(&mut self) {
+        let prefs = self.display_prefs();
+        let mut any_changed = false;
+        for idx in 0..self.transcript.len() {
+            if self.transcript[idx].refresh_display(prefs) {
+                any_changed = true;
+                if let Some(cache) = self.rendered.get_mut(idx) {
+                    cache.dirty = true;
+                    cache.header = role_header(&self.theme, self.transcript[idx].role);
+                }
+            }
+        }
+        if any_changed {
+            self.next_transcript_rev();
+        }
+    }
+
     fn ensure_rendered(&mut self, width: usize) {
         let width = width.max(1);
 
@@ -553,11 +706,7 @@ impl App {
     }
 
     fn push_system_message(&mut self, text: impl Into<String>) {
-        self.transcript.push(ChatEntry {
-            role: Role::System,
-            text: text.into(),
-        });
-        self.rendered.push(RenderedEntry::new(Role::System, &self.theme));
+        self.append_entry(ChatEntry::plain(Role::System, text));
         scroll_to_bottom(self);
     }
 
@@ -609,12 +758,14 @@ impl App {
         self.tool_entry_for_id.clear();
         self.permission_prompt = None;
         self.active_assistant_idx = None;
+        self.active_thinking_idx = None;
         self.in_flight = false;
         self.run_started_at = None;
         self.run_stream_chars = 0;
         self.dismiss_typeahead();
         self.scroll_top = 0;
         self.scroll_follow = true;
+        self.next_transcript_rev();
         self.push_system_message("Started a new session. Previous transcript remains on disk.");
         self.status = "session cleared".to_string();
         Ok(())
@@ -667,18 +818,19 @@ impl App {
         }
         self.permission_prompt = None;
         self.active_assistant_idx = None;
+        self.active_thinking_idx = None;
         self.tool_entry_for_id.clear();
         self.dismiss_typeahead();
         self.dialog = None;
         self.in_flight = false;
         self.run_started_at = None;
         self.run_stream_chars = 0;
-        self.transcript = transcript_from_history(&self.history);
+        self.transcript = transcript_from_history(&self.history, self.display_prefs());
         if self.transcript.is_empty() {
-            self.transcript.push(ChatEntry {
-                role: Role::System,
-                text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
-            });
+            self.transcript.push(ChatEntry::plain(
+                Role::System,
+                "Ctrl+C to exit. Type a prompt and press Enter.",
+            ));
         }
         self.rendered = self
             .transcript
@@ -688,6 +840,7 @@ impl App {
         self.render_width = 0;
         self.scroll_top = 0;
         self.scroll_follow = true;
+        self.transcript_rev = self.transcript_rev.saturating_add(1);
         self.push_system_message(note);
         self.status = status.into();
     }
@@ -764,6 +917,7 @@ fn role_header(theme: &Theme, role: Role) -> Line<'static> {
         Role::Assistant => ("Claude", theme.role_assistant),
         Role::Tool => ("Tool", theme.role_tool),
         Role::System => ("System", theme.role_system),
+        Role::Thinking => ("Thinking", theme.role_thinking),
     };
 
     Line::from(Span::styled(label, style))
@@ -986,21 +1140,28 @@ pub async fn run_tui(
         .map(|m| keymap.apply_user_overrides(m))
         .unwrap_or_default();
 
-    let mut transcript = transcript_from_history(&history);
+    let show_thinking = settings.tui_show_thinking.unwrap_or(false);
+    let condensed = settings.tui_condensed.unwrap_or(false);
+    let display_prefs = DisplayPrefs {
+        show_thinking,
+        condensed,
+    };
+
+    let mut transcript = transcript_from_history(&history, display_prefs);
     if transcript.is_empty() {
-        transcript.push(ChatEntry {
-            role: Role::System,
-            text: "Ctrl+C to exit. Type a prompt and press Enter.".to_string(),
-        });
+        transcript.push(ChatEntry::plain(
+            Role::System,
+            "Ctrl+C to exit. Type a prompt and press Enter.",
+        ));
     }
     if !keymap_warnings.is_empty() {
-        transcript.push(ChatEntry {
-            role: Role::System,
-            text: format!(
+        transcript.push(ChatEntry::plain(
+            Role::System,
+            format!(
                 "warn: some tuiKeybindings entries were ignored:\n- {}",
                 keymap_warnings.join("\n- ")
             ),
-        });
+        ));
     }
 
     let theme_name = settings
@@ -1042,9 +1203,13 @@ pub async fn run_tui(
         spinner_idx: 0,
         in_flight: false,
         active_assistant_idx: None,
+        active_thinking_idx: None,
         run_started_at: None,
         run_stream_chars: 0,
         last_turn_tokens_per_sec: None,
+        show_thinking,
+        condensed,
+        transcript_rev: 1,
         transcript,
         rendered,
         render_width: 0,
@@ -1798,6 +1963,8 @@ async fn execute_slash_command(
 - cwd: `{}`\n\
 - model: `{}`\n\
 - theme: `{}`\n\
+- condensed: `{}`\n\
+- thinking: `{}`\n\
 - mode: `{}`\n\
 - in flight: `{}`\n\
 - scroll: `{}`\n\
@@ -1810,6 +1977,8 @@ async fn execute_slash_command(
                 app.cwd.display(),
                 app.model,
                 app.theme.name.as_str(),
+                app.condensed,
+                app.show_thinking,
                 if app.vim.is_some() { "vim" } else { "normal" },
                 app.in_flight,
                 if app.scroll_follow {
@@ -1837,6 +2006,98 @@ async fn execute_slash_command(
 
             app.push_system_message(body);
             app.status = "status".to_string();
+        }
+        "thinking" => {
+            let mut desired: Option<bool> = None;
+            if !args.is_empty() {
+                let raw = args.join(" ").trim().to_ascii_lowercase();
+                match raw.as_str() {
+                    "on" | "show" | "true" | "1" => desired = Some(true),
+                    "off" | "hide" | "false" | "0" => desired = Some(false),
+                    _ => {
+                        app.push_system_message("usage: /thinking [on|off]");
+                        app.status = "thinking usage".to_string();
+                        return Ok(false);
+                    }
+                }
+            }
+
+            if args.is_empty() {
+                app.push_system_message(format!(
+                    "Thinking\n\n- showThinking: `{}`\n\nUsage: /thinking [on|off]",
+                    app.show_thinking
+                ));
+                app.status = format!("thinking {}", app.show_thinking);
+                return Ok(false);
+            }
+
+            let next = desired.unwrap_or(!app.show_thinking);
+            if next != app.show_thinking {
+                app.show_thinking = next;
+                app.refresh_display_prefs();
+                if let Err(err) = persist_tui_show_thinking(&app.user_settings_path, next) {
+                    app.push_system_message(format!("warn: failed to persist thinking: {err}"));
+                }
+                app.push_toast(
+                    ToastLevel::Info,
+                    format!(
+                        "Thinking: {}",
+                        if next { "shown" } else { "hidden" }
+                    ),
+                    Duration::from_secs(3),
+                );
+            }
+            app.status = format!("thinking {}", app.show_thinking);
+        }
+        "condensed" => {
+            let mut desired: Option<bool> = None;
+            if !args.is_empty() {
+                let raw = args.join(" ").trim().to_ascii_lowercase();
+                match raw.as_str() {
+                    "on" | "true" | "1" => desired = Some(true),
+                    "off" | "false" | "0" => desired = Some(false),
+                    _ => {
+                        app.push_system_message("usage: /condensed [on|off]");
+                        app.status = "condensed usage".to_string();
+                        return Ok(false);
+                    }
+                }
+            }
+
+            if args.is_empty() {
+                app.push_system_message(format!(
+                    "Condensed Mode\n\n- condensed: `{}`\n\nUsage: /condensed [on|off]",
+                    app.condensed
+                ));
+                app.status = format!("condensed {}", app.condensed);
+                return Ok(false);
+            }
+
+            let next = desired.unwrap_or(!app.condensed);
+            if next != app.condensed {
+                app.condensed = next;
+                app.refresh_display_prefs();
+                if let Err(err) = persist_tui_condensed(&app.user_settings_path, next) {
+                    app.push_system_message(format!("warn: failed to persist condensed: {err}"));
+                }
+                app.push_toast(
+                    ToastLevel::Info,
+                    format!(
+                        "Condensed: {}",
+                        if next { "on" } else { "off" }
+                    ),
+                    Duration::from_secs(3),
+                );
+            }
+            app.status = format!("condensed {}", app.condensed);
+        }
+        "voice" => {
+            app.push_system_message(
+                "Voice input is not implemented in the Rust TUI yet.\n\n\
+Planned behavior (Week 11): hold Space to talk, then send the transcript.\n\
+Current status: feature stub only.",
+            );
+            app.status = "voice".to_string();
         }
         "vim" => {
             let mut desired: Option<bool> = None;
@@ -2050,12 +2311,9 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
     app.permission_prompt = None;
     app.tool_entry_for_id.clear();
     app.active_assistant_idx = None;
+    app.active_thinking_idx = None;
 
-    app.transcript.push(ChatEntry {
-        role: Role::User,
-        text: prompt.clone(),
-    });
-    app.rendered.push(RenderedEntry::new(Role::User, &app.theme));
+    app.append_entry(ChatEntry::plain(Role::User, prompt.clone()));
 
     // Week 3: make sure the new turn is visible even if the user had scrolled up.
     scroll_to_bottom(app);
@@ -2096,6 +2354,10 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
                     if let Some(text) = crate::extract_text_delta(event) {
                         let _ = tx_for_deltas.send(QueryEvent::TextDelta(text.to_string()));
                     }
+                    if let Some(thinking) = crate::extract_thinking_delta(event) {
+                        let _ =
+                            tx_for_deltas.send(QueryEvent::ThinkingDelta(thinking.to_string()));
+                    }
                     Ok(())
                 },
                 observer,
@@ -2125,18 +2387,21 @@ fn submit_prompt(app: &mut App, query_tx: mpsc::UnboundedSender<QueryEvent>) -> 
 fn handle_query_event(app: &mut App, qev: QueryEvent) {
     match qev {
         QueryEvent::TextDelta(delta) => {
+            // If the model streamed a thinking block first, it typically ends before text starts.
+            if let Some(idx) = app.active_thinking_idx.take() {
+                app.refresh_entry(idx);
+            }
+
             let delta_chars = delta.chars().count();
             let idx = match app.active_assistant_idx {
                 Some(idx) => idx,
                 None => {
-                    app.transcript.push(ChatEntry {
-                        role: Role::Assistant,
-                        text: String::new(),
-                    });
+                    app.transcript.push(ChatEntry::plain(Role::Assistant, String::new()));
                     app.rendered
                         .push(RenderedEntry::new_streaming(Role::Assistant, &app.theme));
                     let idx = app.transcript.len().saturating_sub(1);
                     app.active_assistant_idx = Some(idx);
+                    app.next_transcript_rev();
                     idx
                 }
             };
@@ -2148,12 +2413,54 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             }
             app.run_stream_chars = app.run_stream_chars.saturating_add(delta_chars);
         }
+        QueryEvent::ThinkingDelta(delta) => {
+            let idx = match app.active_thinking_idx {
+                Some(idx) => idx,
+                None => {
+                    let entry = ChatEntry::thinking(String::new(), app.display_prefs());
+                    app.append_entry(entry);
+                    let idx = app.transcript.len().saturating_sub(1);
+                    app.active_thinking_idx = Some(idx);
+                    idx
+                }
+            };
+
+            let prefs = app.display_prefs();
+            let show_thinking = app.show_thinking;
+
+            if let Some(entry) = app.transcript.get_mut(idx) {
+                match &mut entry.kind {
+                    ChatEntryKind::Thinking(t) => t.thinking.push_str(&delta),
+                    other => {
+                        // Defensive: preserve previous displayed text, but ensure kind matches.
+                        let t = ThinkingEntry { thinking: delta };
+                        let text = render_thinking_entry(&t, app.show_thinking);
+                        *other = ChatEntryKind::Thinking(t);
+                        entry.role = Role::Thinking;
+                        entry.text = text;
+                    }
+                }
+
+                // Only refresh the rendered markdown when thinking is visible; otherwise keep the
+                // placeholder stable and refresh at block boundaries / completion.
+                if show_thinking {
+                    entry.refresh_display(prefs);
+                    if let Some(cache) = app.rendered.get_mut(idx) {
+                        cache.dirty = true;
+                    }
+                    app.next_transcript_rev();
+                }
+            }
+        }
         QueryEvent::PermissionRequest {
             id,
             name,
             input,
             reply_tx,
         } => {
+            if let Some(idx) = app.active_thinking_idx.take() {
+                app.refresh_entry(idx);
+            }
             // The assistant turn that requested tool use has finished streaming at this point.
             if let Some(idx) = app.active_assistant_idx.take() {
                 app.finalize_streaming(idx);
@@ -2172,19 +2479,34 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.status = format!("permission required • {activity}");
         }
         QueryEvent::ToolUseStart { id, name, input } => {
+            if let Some(idx) = app.active_thinking_idx.take() {
+                app.refresh_entry(idx);
+            }
             if let Some(idx) = app.active_assistant_idx.take() {
                 app.finalize_streaming(idx);
             }
 
-            let text = format_tool_running_markdown(&name, &input);
-            app.transcript.push(ChatEntry {
-                role: Role::Tool,
-                text,
-            });
-            app.rendered.push(RenderedEntry::new(Role::Tool, &app.theme));
+            let entry = ChatEntry::tool(
+                name.clone(),
+                input.clone(),
+                ToolEntryState::Running,
+                app.display_prefs(),
+            );
+            app.append_entry(entry);
             let idx = app.transcript.len().saturating_sub(1);
             app.tool_entry_for_id.insert(id, idx);
             app.status = tool_activity_status(&name, &input);
+
+            if name == "Agent" {
+                if let Some(desc) = input.get("description").and_then(|v| v.as_str()) {
+                    let preview = crate::one_line_preview(desc, 60);
+                    app.push_toast(
+                        ToastLevel::Info,
+                        format!("Agent started: {preview}"),
+                        Duration::from_secs(3),
+                    );
+                }
+            }
         }
         QueryEvent::ToolUseResult {
             id,
@@ -2193,27 +2515,60 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             result,
             is_error,
         } => {
-            let text = format_tool_result_markdown(&name, &input, &result, is_error);
+            let state = ToolEntryState::Result {
+                result: result.clone(),
+                is_error,
+            };
+            let prefs = app.display_prefs();
+
             if let Some(idx) = app.tool_entry_for_id.remove(&id) {
                 if let Some(entry) = app.transcript.get_mut(idx) {
-                    entry.text = text;
+                    entry.role = Role::Tool;
+                    match &mut entry.kind {
+                        ChatEntryKind::Tool(tool) => {
+                            tool.name = name.clone();
+                            tool.input = input.clone();
+                            tool.state = state.clone();
+                            entry.refresh_display(prefs);
+                        }
+                        other => {
+                            *other = ChatEntryKind::Tool(ToolEntry {
+                                name: name.clone(),
+                                input: input.clone(),
+                                state,
+                            });
+                            entry.refresh_display(prefs);
+                        }
+                    }
                 }
                 if let Some(cache) = app.rendered.get_mut(idx) {
                     cache.dirty = true;
                 }
+                app.next_transcript_rev();
             } else {
-                app.transcript.push(ChatEntry {
-                    role: Role::Tool,
-                    text,
-                });
-                app.rendered.push(RenderedEntry::new(Role::Tool, &app.theme));
+                let entry = ChatEntry::tool(name.clone(), input.clone(), state, app.display_prefs());
+                app.append_entry(entry);
             }
             app.status = format!("{name} done");
+
+            if name == "Agent" {
+                if let Some(desc) = input.get("description").and_then(|v| v.as_str()) {
+                    let preview = crate::one_line_preview(desc, 60);
+                    app.push_toast(
+                        ToastLevel::Info,
+                        format!("Agent finished: {preview}"),
+                        Duration::from_secs(3),
+                    );
+                }
+            }
         }
         QueryEvent::Finished(result) => {
             let finished_idx = app.active_assistant_idx;
             app.in_flight = false;
             app.active_assistant_idx = None;
+            if let Some(idx) = app.active_thinking_idx.take() {
+                app.refresh_entry(idx);
+            }
             app.permission_prompt = None;
             let elapsed = app.run_started_at.take().map(|t| t.elapsed());
             app.last_turn_tokens_per_sec = elapsed.and_then(|d| {
@@ -2229,6 +2584,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             if let Some(idx) = finished_idx {
                 app.finalize_streaming(idx);
             }
+            app.next_transcript_rev();
 
             app.status = match result.cost_usd {
                 Some(cost) => format!(
@@ -2276,6 +2632,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.run_started_at = None;
             app.run_stream_chars = 0;
             app.active_assistant_idx = None;
+            app.active_thinking_idx = None;
             app.permission_prompt = None;
 
             // If we created an empty assistant entry for streaming, remove it on error.
@@ -2283,15 +2640,12 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                 if last.role == Role::Assistant && last.text.is_empty() {
                     app.transcript.pop();
                     app.rendered.pop();
+                    app.next_transcript_rev();
                 }
             }
 
             app.status = format!("error: {}", crate::one_line_preview(&err, 160));
-            app.transcript.push(ChatEntry {
-                role: Role::System,
-                text: format!("error: {err}"),
-            });
-            app.rendered.push(RenderedEntry::new(Role::System, &app.theme));
+            app.append_entry(ChatEntry::plain(Role::System, format!("error: {err}")));
             app.push_toast(ToastLevel::Error, "Error", Duration::from_secs(4));
         }
     }
@@ -2514,19 +2868,60 @@ fn render_status_line(app: &App, spin: &str) -> Line<'static> {
         app.model, app.total_input_tokens, app.total_output_tokens,
     );
 
+    let agent_hint = active_agent_hint(app)
+        .map(|hint| format!(" • {hint}"))
+        .unwrap_or_default();
+
     Line::from(format!(
-        "{spin} {metrics} • {}{scroll_hint}{input_hint}",
-        app.status
+        "{spin} {metrics} • {}{agent_hint}{scroll_hint}{input_hint}",
+        app.status,
     ))
     .style(style)
+}
+
+fn active_agent_hint(app: &App) -> Option<String> {
+    let mut labels = Vec::new();
+    for entry in &app.transcript {
+        let ChatEntryKind::Tool(tool) = &entry.kind else {
+            continue;
+        };
+        if tool.name != "Agent" {
+            continue;
+        }
+        if !matches!(tool.state, ToolEntryState::Running) {
+            continue;
+        }
+
+        let label = tool
+            .input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| crate::one_line_preview(s, 32))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sub-agent".to_string());
+        labels.push(label);
+    }
+
+    if labels.is_empty() {
+        return None;
+    }
+
+    if labels.len() == 1 {
+        return Some(format!("agent {}", labels[0]));
+    }
+
+    Some(format!("agents {} (+{})", labels[0], labels.len() - 1))
 }
 
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     app.sync_typeahead();
     if let Some(DialogState::TranscriptSearch(dialog)) = app.dialog.as_mut() {
         let q = dialog.query.as_str().trim().to_ascii_lowercase();
-        if q != dialog.last_query || dialog.last_transcript_len != app.transcript.len() {
-            recompute_search_hits(dialog, &app.transcript);
+        if q != dialog.last_query
+            || dialog.last_transcript_len != app.transcript.len()
+            || dialog.last_transcript_rev != app.transcript_rev
+        {
+            recompute_search_hits(dialog, &app.transcript, app.transcript_rev);
         }
     }
     let size = f.size();
@@ -3047,19 +3442,25 @@ fn open_transcript_search(app: &mut App, initial_query: Option<String>) {
         hits: Vec::new(),
         last_query: String::new(),
         last_transcript_len: 0,
+        last_transcript_rev: 0,
     };
     if let Some(query) = initial_query {
         dialog.query.set_text(query);
     }
-    recompute_search_hits(&mut dialog, &app.transcript);
+    recompute_search_hits(&mut dialog, &app.transcript, app.transcript_rev);
     app.dialog = Some(DialogState::TranscriptSearch(dialog));
     app.status = "search transcript".to_string();
 }
 
-fn recompute_search_hits(dialog: &mut TranscriptSearchDialog, transcript: &[ChatEntry]) {
+fn recompute_search_hits(
+    dialog: &mut TranscriptSearchDialog,
+    transcript: &[ChatEntry],
+    transcript_rev: u64,
+) {
     let query = dialog.query.as_str().trim().to_ascii_lowercase();
     dialog.last_query = query.clone();
     dialog.last_transcript_len = transcript.len();
+    dialog.last_transcript_rev = transcript_rev;
     dialog.hits.clear();
 
     if query.is_empty() {
@@ -3306,11 +3707,11 @@ async fn handle_dialog_key(
             }
             KeyCode::Backspace => {
                 dialog.query.backspace();
-                recompute_search_hits(dialog, &app.transcript);
+                recompute_search_hits(dialog, &app.transcript, app.transcript_rev);
             }
             KeyCode::Delete => {
                 dialog.query.delete_forward();
-                recompute_search_hits(dialog, &app.transcript);
+                recompute_search_hits(dialog, &app.transcript, app.transcript_rev);
             }
             KeyCode::Left => dialog.query.move_left(false),
             KeyCode::Right => dialog.query.move_right(false),
@@ -3320,7 +3721,7 @@ async fn handle_dialog_key(
             KeyCode::Char('e') | KeyCode::Char('E') if ctrl => dialog.query.move_to_end(false),
             KeyCode::Char(ch) if !ctrl && !alt => {
                 dialog.query.insert_char(ch);
-                recompute_search_hits(dialog, &app.transcript);
+                recompute_search_hits(dialog, &app.transcript, app.transcript_rev);
             }
             KeyCode::Enter => {
                 if let Some(hit) = dialog.hits.get(dialog.selected) {
@@ -3375,6 +3776,42 @@ fn persist_tui_theme(settings_path: &Path, theme_name: &str) -> anyhow::Result<(
     obj.insert(
         "tuiTheme".to_string(),
         serde_json::Value::String(theme_name.to_string()),
+    );
+    crate::save_settings_json(settings_path, &root)?;
+    Ok(())
+}
+
+fn persist_tui_show_thinking(settings_path: &Path, show: bool) -> anyhow::Result<()> {
+    let _lock = crate::lock_settings_path(settings_path)?;
+    let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
+    let Some(obj) = root.as_object_mut() else {
+        anyhow::bail!(
+            "settings root must be a JSON object: {}",
+            settings_path.display()
+        );
+    };
+
+    obj.insert(
+        "tuiShowThinking".to_string(),
+        serde_json::Value::Bool(show),
+    );
+    crate::save_settings_json(settings_path, &root)?;
+    Ok(())
+}
+
+fn persist_tui_condensed(settings_path: &Path, condensed: bool) -> anyhow::Result<()> {
+    let _lock = crate::lock_settings_path(settings_path)?;
+    let mut root = crate::load_settings_json_object_or_empty(settings_path)?;
+    let Some(obj) = root.as_object_mut() else {
+        anyhow::bail!(
+            "settings root must be a JSON object: {}",
+            settings_path.display()
+        );
+    };
+
+    obj.insert(
+        "tuiCondensed".to_string(),
+        serde_json::Value::Bool(condensed),
     );
     crate::save_settings_json(settings_path, &root)?;
     Ok(())
@@ -3615,6 +4052,7 @@ fn render_transcript_search_dialog(
                 Role::Assistant => "Claude",
                 Role::Tool => "Tool",
                 Role::System => "System",
+                Role::Thinking => "Thinking",
             };
             let mut item = ListItem::new(Line::from(format!(
                 "{role} #{:03}  {}",
@@ -3652,7 +4090,90 @@ fn format_updated_at_ms(updated_at_ms: u64) -> String {
     ts.format("%Y-%m-%d %H:%M").to_string()
 }
 
-fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
+fn render_thinking_entry(entry: &ThinkingEntry, show_thinking: bool) -> String {
+    if show_thinking {
+        let body = crate::truncate_chars(entry.thinking.trim(), 40_000);
+        if body.is_empty() {
+            "_Thinking..._".to_string()
+        } else {
+            format!("```text\n{body}\n```")
+        }
+    } else {
+        let approx_tokens = (entry.thinking.chars().count() / 4).max(1);
+        format!(
+            "_Thinking hidden._ Use `/thinking on` to expand it. (~{approx_tokens} tokens)"
+        )
+    }
+}
+
+fn summarize_tool_result(tool_name: &str, result: &serde_json::Value, is_error: bool) -> String {
+    let prefix = if is_error { "error" } else { "ok" };
+
+    match result {
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                format!("{prefix} • empty output")
+            } else {
+                let line_count = s.lines().count();
+                let preview = crate::one_line_preview(s, 100);
+                format!("{prefix} • {line_count} line(s) • {preview}")
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            format!("{prefix} • {} item(s)", arr.len())
+        }
+        serde_json::Value::Object(map) => {
+            if tool_name == "Agent" {
+                if let Some(text) = result.as_str() {
+                    let preview = crate::one_line_preview(text, 100);
+                    return format!("{prefix} • report • {preview}");
+                }
+            }
+            let keys = map.keys().take(4).cloned().collect::<Vec<_>>();
+            if keys.is_empty() {
+                format!("{prefix} • empty object")
+            } else {
+                format!("{prefix} • fields: {}", keys.join(", "))
+            }
+        }
+        serde_json::Value::Null => format!("{prefix} • null"),
+        serde_json::Value::Bool(v) => format!("{prefix} • {v}"),
+        serde_json::Value::Number(v) => format!("{prefix} • {v}"),
+    }
+}
+
+fn render_tool_entry(tool: &ToolEntry, condensed: bool) -> String {
+    match &tool.state {
+        ToolEntryState::Running => format_tool_running_markdown(&tool.name, &tool.input),
+        ToolEntryState::Result { result, is_error } => {
+            if condensed {
+                let mut out = String::new();
+                let status = if *is_error { " (error)" } else { "" };
+                if let Some(primary) = tool_primary_summary(&tool.name, &tool.input) {
+                    if !primary.contains('\n') && !primary.contains('`') {
+                        let preview = crate::truncate_chars(primary.trim(), 200);
+                        out.push_str(&format!("**{}**{status}: `{preview}`\n\n", tool.name));
+                    } else {
+                        out.push_str(&format!("**{}**{status}\n\n", tool.name));
+                    }
+                } else {
+                    out.push_str(&format!("**{}**{status}\n\n", tool.name));
+                }
+
+                let summary = summarize_tool_result(&tool.name, result, *is_error);
+                out.push_str(&format!(
+                    "Result summary: {summary}\n\n_Condensed view._ Use `/condensed off` to show full output."
+                ));
+                out
+            } else {
+                format_tool_result_markdown(&tool.name, &tool.input, result, *is_error)
+            }
+        }
+    }
+}
+
+fn transcript_from_history(history: &[Message], prefs: DisplayPrefs) -> Vec<ChatEntry> {
     let mut out: Vec<ChatEntry> = Vec::new();
     let mut tool_input_for_id: HashMap<String, (String, serde_json::Value)> = HashMap::new();
     let mut tool_entry_for_id: HashMap<String, usize> = HashMap::new();
@@ -3676,10 +4197,7 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                             is_error,
                         } => {
                             if !text_buf.trim().is_empty() {
-                                out.push(ChatEntry {
-                                    role: Role::User,
-                                    text: std::mem::take(&mut text_buf),
-                                });
+                                out.push(ChatEntry::plain(Role::User, std::mem::take(&mut text_buf)));
                             }
 
                             let (tool_name, tool_input) = tool_input_for_id
@@ -3689,33 +4207,39 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                                     (format!("Tool({})", tool_use_id), serde_json::Value::Null)
                                 });
 
-                            let md = format_tool_result_markdown(
-                                &tool_name,
-                                &tool_input,
-                                content,
-                                *is_error,
+                            let tool_entry = ChatEntry::tool(
+                                tool_name.clone(),
+                                tool_input.clone(),
+                                ToolEntryState::Result {
+                                    result: content.clone(),
+                                    is_error: *is_error,
+                                },
+                                prefs,
                             );
 
                             if let Some(idx) = tool_entry_for_id.get(tool_use_id).copied() {
                                 if let Some(entry) = out.get_mut(idx) {
-                                    entry.text = md;
+                                    *entry = tool_entry;
                                 }
                             } else {
-                                out.push(ChatEntry {
-                                    role: Role::Tool,
-                                    text: md,
-                                });
+                                out.push(tool_entry);
                             }
                         }
-                        ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {}
+                        ContentBlock::Thinking { thinking } => {
+                            if !text_buf.trim().is_empty() {
+                                out.push(ChatEntry::plain(
+                                    Role::User,
+                                    std::mem::take(&mut text_buf),
+                                ));
+                            }
+                            out.push(ChatEntry::thinking(thinking.clone(), prefs));
+                        }
+                        ContentBlock::ToolUse { .. } => {}
                     }
                 }
 
                 if !text_buf.trim().is_empty() {
-                    out.push(ChatEntry {
-                        role: Role::User,
-                        text: text_buf,
-                    });
+                    out.push(ChatEntry::plain(Role::User, text_buf));
                 }
             }
             Message::Assistant(claude_core::types::message::AssistantMessage {
@@ -3733,30 +4257,37 @@ fn transcript_from_history(history: &[Message]) -> Vec<ChatEntry> {
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             if !text_buf.trim().is_empty() {
-                                out.push(ChatEntry {
-                                    role: Role::Assistant,
-                                    text: std::mem::take(&mut text_buf),
-                                });
+                                out.push(ChatEntry::plain(
+                                    Role::Assistant,
+                                    std::mem::take(&mut text_buf),
+                                ));
                             }
 
                             tool_input_for_id.insert(id.clone(), (name.clone(), input.clone()));
 
-                            let md = format_tool_running_markdown(name, input);
-                            out.push(ChatEntry {
-                                role: Role::Tool,
-                                text: md,
-                            });
+                            out.push(ChatEntry::tool(
+                                name.clone(),
+                                input.clone(),
+                                ToolEntryState::Running,
+                                prefs,
+                            ));
                             tool_entry_for_id.insert(id.clone(), out.len().saturating_sub(1));
                         }
-                        ContentBlock::ToolResult { .. } | ContentBlock::Thinking { .. } => {}
+                        ContentBlock::Thinking { thinking } => {
+                            if !text_buf.trim().is_empty() {
+                                out.push(ChatEntry::plain(
+                                    Role::Assistant,
+                                    std::mem::take(&mut text_buf),
+                                ));
+                            }
+                            out.push(ChatEntry::thinking(thinking.clone(), prefs));
+                        }
+                        ContentBlock::ToolResult { .. } => {}
                     }
                 }
 
                 if !text_buf.trim().is_empty() {
-                    out.push(ChatEntry {
-                        role: Role::Assistant,
-                        text: text_buf,
-                    });
+                    out.push(ChatEntry::plain(Role::Assistant, text_buf));
                 }
             }
         }
@@ -3852,6 +4383,18 @@ fn tool_activity_status(tool_name: &str, input: &serde_json::Value) -> String {
                 "Searching...".to_string()
             } else {
                 format!("Searching: {}", crate::one_line_preview(pat, 120))
+            }
+        }
+        "Agent" => {
+            let desc = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if desc.is_empty() {
+                "Running agent...".to_string()
+            } else {
+                format!("Agent: {}", crate::one_line_preview(desc, 120))
             }
         }
         _ => format!("Running {tool_name}..."),
@@ -4413,4 +4956,96 @@ fn write_session_meta_silent(
         return;
     };
     let _ = std::fs::write(meta_path, bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_core::types::message::AssistantMessage;
+
+    #[test]
+    fn thinking_entry_can_toggle_visibility() {
+        let mut entry = ChatEntry::thinking(
+            "reasoning about the next step",
+            DisplayPrefs {
+                show_thinking: false,
+                condensed: false,
+            },
+        );
+        assert!(entry.text.contains("Thinking hidden"));
+
+        let changed = entry.refresh_display(DisplayPrefs {
+            show_thinking: true,
+            condensed: false,
+        });
+        assert!(changed);
+        assert!(entry.text.contains("reasoning about the next step"));
+        assert!(!entry.text.contains("Thinking hidden"));
+    }
+
+    #[test]
+    fn condensed_tool_entry_hides_full_payload() {
+        let entry = ChatEntry::tool(
+            "Bash",
+            serde_json::json!({ "command": "printf 'hello\\nworld'" }),
+            ToolEntryState::Result {
+                result: serde_json::Value::String("hello\nworld\n".to_string()),
+                is_error: false,
+            },
+            DisplayPrefs {
+                show_thinking: false,
+                condensed: true,
+            },
+        );
+
+        assert!(entry.text.contains("Result summary:"));
+        assert!(entry.text.contains("Condensed view"));
+        assert!(!entry.text.contains("```text"));
+    }
+
+    #[test]
+    fn transcript_from_history_renders_thinking_and_tool_result_entries() {
+        let history = vec![
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "hidden chain of thought".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "Agent".to_string(),
+                        input: serde_json::json!({
+                            "description": "research issue",
+                            "prompt": "Investigate",
+                        }),
+                    },
+                ],
+                model: None,
+                stop_reason: None,
+                usage: None,
+            }),
+            Message::User(UserMessage {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    content: serde_json::Value::String("done".to_string()),
+                    is_error: false,
+                }],
+            }),
+        ];
+
+        let transcript = transcript_from_history(
+            &history,
+            DisplayPrefs {
+                show_thinking: false,
+                condensed: true,
+            },
+        );
+
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].role, Role::Thinking);
+        assert!(transcript[0].text.contains("Thinking hidden"));
+        assert_eq!(transcript[1].role, Role::Tool);
+        assert!(transcript[1].text.contains("Result summary:"));
+        assert!(transcript[1].text.contains("research issue"));
+    }
 }

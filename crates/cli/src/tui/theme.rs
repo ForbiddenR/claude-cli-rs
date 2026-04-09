@@ -41,6 +41,7 @@ pub struct Theme {
     pub role_assistant: Style,
     pub role_tool: Style,
     pub role_system: Style,
+    pub role_thinking: Style,
 
     // Toasts
     pub toast_info: Style,
@@ -77,6 +78,9 @@ impl Theme {
                 role_system: Style::default()
                     .fg(Color::Rgb(147, 153, 178))
                     .add_modifier(Modifier::DIM),
+                role_thinking: Style::default()
+                    .fg(Color::Rgb(148, 226, 213))
+                    .add_modifier(Modifier::DIM),
                 toast_info: Style::default()
                     .fg(Color::Black)
                     .bg(Color::Rgb(137, 180, 250))
@@ -106,6 +110,7 @@ impl Theme {
                 role_assistant: Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
                 role_tool: Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                 role_system: Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                role_thinking: Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                 toast_info: Style::default()
                     .fg(Color::White)
                     .bg(Color::Blue)
@@ -126,4 +131,3 @@ impl Theme {
         ThemeName::ALL.iter().map(|t| t.as_str()).collect()
     }
 }
-

@@ -111,6 +111,25 @@ pub struct Settings {
     )]
     pub tui_theme: Option<String>,
 
+    /// When true, render assistant `thinking` blocks in the TUI transcript.
+    /// When false, show a short placeholder instead (collapsible via `/thinking on`).
+    #[serde(
+        default,
+        rename = "tuiShowThinking",
+        alias = "tui_show_thinking",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tui_show_thinking: Option<bool>,
+
+    /// When true, collapse tool results in the TUI transcript (toggle via `/condensed`).
+    #[serde(
+        default,
+        rename = "tuiCondensed",
+        alias = "tui_condensed",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tui_condensed: Option<bool>,
+
     #[serde(
         default,
         rename = "tuiOnboardingSeen",
@@ -179,6 +198,12 @@ impl Settings {
             }
             if layer.tui_theme.is_some() {
                 out.tui_theme = layer.tui_theme.clone();
+            }
+            if layer.tui_show_thinking.is_some() {
+                out.tui_show_thinking = layer.tui_show_thinking;
+            }
+            if layer.tui_condensed.is_some() {
+                out.tui_condensed = layer.tui_condensed;
             }
             if layer.tui_onboarding_seen.is_some() {
                 out.tui_onboarding_seen = layer.tui_onboarding_seen;
