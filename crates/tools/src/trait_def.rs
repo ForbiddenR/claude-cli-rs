@@ -10,6 +10,7 @@ use crate::{SessionState, ToolResultStore};
 pub trait AgentExecutor: Send + Sync {
     async fn run_agent(
         &self,
+        tool_use_id: Option<String>,
         description: Option<String>,
         prompt: String,
         depth: u32,
@@ -38,6 +39,13 @@ pub struct ToolUseContext {
 
     /// Allows tools (Agent) to spawn sub-agents.
     pub agent: Option<Arc<dyn AgentExecutor>>,
+
+    /// The currently-executing tool call id (Anthropic tool_use_id) if available.
+    ///
+    /// This is set by the query engine right before `Tool::call` and cleared
+    /// afterwards. Tools can use it to correlate nested operations with the
+    /// parent tool call (e.g., agent progress display).
+    pub current_tool_use_id: Option<String>,
 
     /// Sub-agent recursion depth; 0 for the main session.
     pub agent_depth: u32,

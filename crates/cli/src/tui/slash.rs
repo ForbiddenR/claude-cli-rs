@@ -37,6 +37,11 @@ pub const SLASH_COMMANDS: &[SlashCommandDef] = &[
         usage: "/condensed [on|off]",
     },
     SlashCommandDef {
+        name: "agents",
+        description: "Show progress for running Agent tool calls",
+        usage: "/agents",
+    },
+    SlashCommandDef {
         name: "voice",
         description: "Show voice-input availability (feature-gated)",
         usage: "/voice",

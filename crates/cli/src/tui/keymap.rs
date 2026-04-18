@@ -27,6 +27,7 @@ pub enum KeyAction {
     ShowModelPicker,
     ResumeSession,
     SearchTranscript,
+    ShowAgents,
 
     TypeaheadNext,
     TypeaheadPrev,
@@ -242,6 +243,7 @@ fn parse_action_name(raw: &str) -> Option<KeyAction> {
         "search" | "find" | "search_transcript" | "searchtranscript" => {
             Some(KeyAction::SearchTranscript)
         }
+        "agents" | "agent_progress" | "show_agents" => Some(KeyAction::ShowAgents),
         "typeahead_next" | "command_next" | "typeahead.next" => Some(KeyAction::TypeaheadNext),
         "typeahead_prev" | "command_prev" | "typeahead.prev" => Some(KeyAction::TypeaheadPrev),
         "typeahead_accept" | "command_accept" | "typeahead.accept" => {

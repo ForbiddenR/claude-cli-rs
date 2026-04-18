@@ -5,4 +5,7 @@ mod mcp_tools;
 pub mod stream_parser;
 pub mod system_prompt;
 
-pub use engine::{PermissionDecision, QueryEngine, QueryEngineConfig, QueryObserver, RunResult};
+pub use engine::{
+    AgentActivity, AgentProgressUpdate, PermissionDecision, QueryEngine, QueryEngineConfig,
+    QueryObserver, RunResult,
+};

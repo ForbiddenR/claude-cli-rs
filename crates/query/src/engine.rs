@@ -34,6 +34,21 @@ pub enum PermissionDecision {
     AlwaysAllowTool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentActivity {
+    pub tool_name: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentProgressUpdate {
+    pub tool_use_count: u64,
+    pub token_count: u64,
+    pub recent_activities: Vec<AgentActivity>,
+    /// Best-effort single-line preview of current agent output.
+    pub output_preview: Option<String>,
+}
+
 #[async_trait]
 pub trait QueryObserver: Send + Sync {
     /// Called immediately before a tool is executed (after permission is granted).
@@ -59,6 +74,13 @@ pub trait QueryObserver: Send + Sync {
     ) -> PermissionDecision {
         PermissionDecision::Deny
     }
+
+    /// Called with best-effort progress updates for `Agent` tool calls.
+    ///
+    /// `agent_tool_use_id` is the tool_use_id of the `Agent` tool invocation in the *parent*
+    /// session (i.e., the leader). This allows UIs to render "teammate" progress while a nested
+    /// query engine run is executing.
+    async fn on_agent_progress(&self, _agent_tool_use_id: &str, _update: &AgentProgressUpdate) {}
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +284,7 @@ impl QueryEngine {
             self.model.clone(),
             self.max_tokens,
             self.cfg.clone(),
+            observer.clone(),
         ));
 
         let mut tool_ctx = ToolUseContext {
@@ -271,6 +294,7 @@ impl QueryEngine {
             session,
             result_store,
             agent: Some(agent_exec),
+            current_tool_use_id: None,
             agent_depth: self.cfg.agent_depth,
             max_agent_depth: self.cfg.max_agent_depth,
         };
@@ -644,7 +668,16 @@ async fn execute_tool_call(
         obs.on_tool_use_start(&id, &name, &input_snapshot).await;
     }
 
-    match tool.call(input, ctx).await {
+    // Expose the tool_use_id to the tool implementation (e.g. Agent progress tracking).
+    let prev_tool_use_id = ctx.current_tool_use_id.take();
+    ctx.current_tool_use_id = Some(id.clone());
+
+    let call_res = tool.call(input, ctx).await;
+
+    // Restore previous state even if the tool errors.
+    ctx.current_tool_use_id = prev_tool_use_id;
+
+    match call_res {
         Ok(mut result) => {
             persist_large_tool_result(tool.as_ref(), &mut result, ctx);
             if let Some(obs) = observer {
@@ -1136,6 +1169,7 @@ struct QueryAgentExecutor {
     model: String,
     max_tokens: u32,
     cfg: QueryEngineConfig,
+    observer: Option<Arc<dyn QueryObserver>>,
 }
 
 impl QueryAgentExecutor {
@@ -1145,6 +1179,7 @@ impl QueryAgentExecutor {
         model: String,
         max_tokens: u32,
         cfg: QueryEngineConfig,
+        observer: Option<Arc<dyn QueryObserver>>,
     ) -> Self {
         Self {
             client,
@@ -1152,7 +1187,210 @@ impl QueryAgentExecutor {
             model,
             max_tokens,
             cfg,
+            observer,
         }
+    }
+}
+
+#[derive(Debug)]
+struct AgentProgressTracker {
+    tool_use_count: u64,
+
+    latest_input_tokens: u64,
+    latest_cache_creation_input_tokens: u64,
+    latest_cache_read_input_tokens: u64,
+
+    cumulative_output_tokens: u64,
+    current_output_tokens: u64,
+
+    recent_activities: Vec<AgentActivity>,
+
+    // Rolling tail of assistant text output to derive a preview.
+    output_tail: String,
+
+    last_sent_at: std::time::Instant,
+    last_sent_token_count: u64,
+    last_sent_tool_use_count: u64,
+    last_sent_output_preview: Option<String>,
+}
+
+impl AgentProgressTracker {
+    fn new() -> Self {
+        Self {
+            tool_use_count: 0,
+            latest_input_tokens: 0,
+            latest_cache_creation_input_tokens: 0,
+            latest_cache_read_input_tokens: 0,
+            cumulative_output_tokens: 0,
+            current_output_tokens: 0,
+            recent_activities: Vec::new(),
+            output_tail: String::new(),
+            last_sent_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(std::time::Instant::now),
+            last_sent_token_count: 0,
+            last_sent_tool_use_count: 0,
+            last_sent_output_preview: None,
+        }
+    }
+
+    fn total_tokens(&self) -> u64 {
+        self.latest_input_tokens
+            + self.latest_cache_creation_input_tokens
+            + self.latest_cache_read_input_tokens
+            + self.cumulative_output_tokens
+            + self.current_output_tokens
+    }
+
+    fn output_preview(&self) -> Option<String> {
+        let s = self.output_tail.trim();
+        if s.is_empty() {
+            return None;
+        }
+        // Single-line preview, aggressively compacted.
+        let mut out = String::new();
+        let mut last_was_space = false;
+        for ch in s.chars() {
+            let is_space = matches!(ch, '\n' | '\r' | '\t' | ' ');
+            if is_space {
+                if last_was_space {
+                    continue;
+                }
+                out.push(' ');
+                last_was_space = true;
+            } else {
+                out.push(ch);
+                last_was_space = false;
+            }
+        }
+        let out = out.trim();
+        if out.is_empty() {
+            None
+        } else {
+            Some(truncate_chars(out, 120))
+        }
+    }
+
+    fn push_activity(&mut self, tool_name: String, input: serde_json::Value) {
+        self.tool_use_count = self.tool_use_count.saturating_add(1);
+        self.recent_activities
+            .push(AgentActivity { tool_name, input });
+        while self.recent_activities.len() > 5 {
+            self.recent_activities.remove(0);
+        }
+    }
+
+    fn push_text_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.output_tail.push_str(delta);
+        // Keep the tail bounded to avoid unbounded growth.
+        if self.output_tail.chars().count() > 600 {
+            self.output_tail = truncate_tail_chars(&self.output_tail, 600);
+        }
+    }
+
+    fn apply_usage(&mut self, usage: &serde_json::Value) {
+        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            self.latest_input_tokens = v;
+        }
+        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            self.current_output_tokens = v;
+        }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.latest_cache_creation_input_tokens = v;
+        }
+        if let Some(v) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.latest_cache_read_input_tokens = v;
+        }
+    }
+
+    fn finish_message(&mut self) {
+        self.cumulative_output_tokens = self
+            .cumulative_output_tokens
+            .saturating_add(self.current_output_tokens);
+        self.current_output_tokens = 0;
+    }
+
+    fn maybe_build_update(&mut self, force: bool) -> Option<AgentProgressUpdate> {
+        let now = std::time::Instant::now();
+        let token_count = self.total_tokens();
+        let tool_use_count = self.tool_use_count;
+        let output_preview = self.output_preview();
+
+        let token_changed = token_count != self.last_sent_token_count;
+        let tool_changed = tool_use_count != self.last_sent_tool_use_count;
+        let preview_changed = output_preview != self.last_sent_output_preview;
+
+        let throttled =
+            now.duration_since(self.last_sent_at) < std::time::Duration::from_millis(250);
+        if !force && throttled && !tool_changed {
+            return None;
+        }
+        if !force && !token_changed && !tool_changed && !preview_changed {
+            return None;
+        }
+
+        self.last_sent_at = now;
+        self.last_sent_token_count = token_count;
+        self.last_sent_tool_use_count = tool_use_count;
+        self.last_sent_output_preview = output_preview.clone();
+
+        Some(AgentProgressUpdate {
+            tool_use_count,
+            token_count,
+            recent_activities: self.recent_activities.clone(),
+            output_preview,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct AgentInnerObserver {
+    tracker: Arc<std::sync::Mutex<AgentProgressTracker>>,
+    tx: tokio::sync::mpsc::UnboundedSender<AgentProgressUpdate>,
+}
+
+#[async_trait]
+impl QueryObserver for AgentInnerObserver {
+    async fn on_tool_use_start(&self, _id: &str, name: &str, input: &serde_json::Value) {
+        let mut maybe = None;
+        if let Ok(mut tracker) = self.tracker.lock() {
+            tracker.push_activity(name.to_string(), input.clone());
+            maybe = tracker.maybe_build_update(true);
+        }
+        if let Some(update) = maybe {
+            let _ = self.tx.send(update);
+        }
+    }
+
+    async fn on_tool_use_result(
+        &self,
+        _id: &str,
+        _name: &str,
+        _input: &serde_json::Value,
+        _result: &serde_json::Value,
+        _is_error: bool,
+    ) {
+        // No-op for now; start events are enough for a useful activity timeline.
+    }
+
+    async fn request_permission(
+        &self,
+        _id: &str,
+        _name: &str,
+        _input: &serde_json::Value,
+    ) -> PermissionDecision {
+        // Agent tool is only enabled in non-interactive permission modes, so this
+        // should rarely fire. Prefer "deny" over implicitly escalating.
+        PermissionDecision::Deny
     }
 }
 
@@ -1160,6 +1398,7 @@ impl QueryAgentExecutor {
 impl AgentExecutor for QueryAgentExecutor {
     async fn run_agent(
         &self,
+        tool_use_id: Option<String>,
         description: Option<String>,
         prompt: String,
         depth: u32,
@@ -1184,7 +1423,117 @@ impl AgentExecutor for QueryAgentExecutor {
             cfg,
         )?;
 
-        let result = engine.run(&prompt, |_event| Ok(())).await?;
+        // Only surface progress for leader-spawned agents (depth=1). Nested agents still run
+        // normally; the parent agent will show "Agent: ..." in its activity list.
+        let enable_progress =
+            depth == 1 && tool_use_id.as_deref().is_some() && self.observer.is_some();
+
+        if !enable_progress {
+            let result = engine.run(&prompt, |_event| Ok(())).await?;
+            return Ok(result.text);
+        }
+
+        let agent_tool_use_id = tool_use_id
+            .clone()
+            .unwrap_or_else(|| "unknown-agent".to_string());
+        let Some(obs) = self.observer.clone() else {
+            let result = engine.run(&prompt, |_event| Ok(())).await?;
+            return Ok(result.text);
+        };
+
+        let tracker = Arc::new(std::sync::Mutex::new(AgentProgressTracker::new()));
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<AgentProgressUpdate>();
+
+        let agent_id_for_forward = agent_tool_use_id.clone();
+        let obs_for_forward = obs.clone();
+        let forward_handle = tokio::spawn(async move {
+            while let Some(update) = progress_rx.recv().await {
+                obs_for_forward
+                    .on_agent_progress(&agent_id_for_forward, &update)
+                    .await;
+            }
+        });
+
+        // Emit an initial progress snapshot so UIs can render immediately.
+        if let Ok(mut t) = tracker.lock() {
+            if let Some(update) = t.maybe_build_update(true) {
+                let _ = progress_tx.send(update);
+            }
+        }
+
+        let inner_observer: Arc<dyn QueryObserver> = Arc::new(AgentInnerObserver {
+            tracker: tracker.clone(),
+            tx: progress_tx.clone(),
+        });
+
+        let history: Vec<Message> = vec![Message::User(UserMessage {
+            content: vec![ContentBlock::Text { text: prompt }],
+        })];
+
+        let result = engine
+            .run_with_history_observed(
+                history,
+                |event| {
+                    if let Some(usage) = match event.get("type").and_then(|v| v.as_str()) {
+                        Some("message_start") => event.get("message").and_then(|m| m.get("usage")),
+                        Some("message_delta") => event.get("usage"),
+                        _ => None,
+                    } {
+                        if let Ok(mut t) = tracker.lock() {
+                            t.apply_usage(usage);
+                            if let Some(update) = t.maybe_build_update(false) {
+                                let _ = progress_tx.send(update);
+                            }
+                        }
+                    }
+
+                    if let Some(ty) = event.get("type").and_then(|v| v.as_str()) {
+                        if ty == "message_stop" {
+                            if let Ok(mut t) = tracker.lock() {
+                                t.finish_message();
+                                if let Some(update) = t.maybe_build_update(false) {
+                                    let _ = progress_tx.send(update);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(text) = event
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .filter(|ty| *ty == "content_block_delta")
+                        .and_then(|_| event.get("delta"))
+                        .and_then(|d| d.get("type").and_then(|v| v.as_str()))
+                        .filter(|ty| *ty == "text_delta")
+                        .and_then(|_| event.get("delta"))
+                        .and_then(|d| d.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if let Ok(mut t) = tracker.lock() {
+                            t.push_text_delta(text);
+                            if let Some(update) = t.maybe_build_update(false) {
+                                let _ = progress_tx.send(update);
+                            }
+                        }
+                    }
+
+                    Ok(())
+                },
+                inner_observer,
+            )
+            .await?;
+
+        // Final flush.
+        if let Ok(mut t) = tracker.lock() {
+            if let Some(update) = t.maybe_build_update(true) {
+                let _ = progress_tx.send(update);
+            }
+        }
+
+        drop(progress_tx);
+        let _ = forward_handle.await;
+
         Ok(result.text)
     }
 }

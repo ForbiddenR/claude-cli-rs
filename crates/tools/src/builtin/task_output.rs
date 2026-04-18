@@ -105,6 +105,7 @@ mod tests {
             session: Arc::new(crate::SessionState::default()),
             result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
             agent: None,
+            current_tool_use_id: None,
             agent_depth: 0,
             max_agent_depth: 2,
         }

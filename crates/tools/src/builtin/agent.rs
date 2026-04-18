@@ -103,8 +103,9 @@ impl Tool for AgentTool {
         };
 
         let depth = ctx.agent_depth.saturating_add(1);
+        let tool_use_id = ctx.current_tool_use_id.clone();
         let text = executor
-            .run_agent(Some(description), prompt, depth)
+            .run_agent(tool_use_id, Some(description), prompt, depth)
             .await
             .unwrap_or_else(|e| format!("agent failed: {e}"));
 
@@ -143,6 +144,7 @@ mod tests {
             session: Arc::new(crate::SessionState::default()),
             result_store: Arc::new(crate::ToolResultStore::new(store_dir).expect("store")),
             agent: None,
+            current_tool_use_id: None,
             agent_depth: 0,
             max_agent_depth: 2,
         }
@@ -209,13 +211,14 @@ mod tests {
     impl crate::AgentExecutor for FakeAgent {
         async fn run_agent(
             &self,
+            tool_use_id: Option<String>,
             description: Option<String>,
             prompt: String,
             depth: u32,
         ) -> anyhow::Result<String> {
             Ok(format!(
-                "fake agent ok: desc={:?} prompt={} depth={}",
-                description, prompt, depth
+                "fake agent ok: id={:?} desc={:?} prompt={} depth={}",
+                tool_use_id, description, prompt, depth
             ))
         }
     }
@@ -227,6 +230,7 @@ mod tests {
         ctx.agent = Some(Arc::new(FakeAgent));
 
         let tool = AgentTool::default();
+        ctx.current_tool_use_id = Some("tool-123".to_string());
         let input = serde_json::json!({
             "description": "Unit test",
             "prompt": "Hello",
@@ -236,6 +240,7 @@ mod tests {
         assert!(!res.is_error);
         let out = res.content.as_str().unwrap_or_default();
         assert!(out.contains("fake agent ok"));
+        assert!(out.contains("tool-123"));
         assert!(out.contains("Hello"));
         assert!(out.contains("depth=1"));
     }

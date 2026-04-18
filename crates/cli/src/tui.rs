@@ -147,6 +147,9 @@ struct App {
     /// Lowercased tool names that are auto-approved in Default permission mode.
     always_allow_tools: Arc<Mutex<HashSet<String>>>,
 
+    // Week 11: agent progress display.
+    agents: Vec<AgentUiEntry>,
+
     // Week 3: scrollback + virtualization
     /// Start line (0-based) of the transcript viewport.
     scroll_top: usize,
@@ -187,6 +190,8 @@ enum DialogState {
     ModelPicker(ModelPickerDialog),
     SessionResume(SessionResumeDialog),
     TranscriptSearch(TranscriptSearchDialog),
+    AgentProgress(AgentProgressDialog),
+    AgentDetail(AgentDetailDialog),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +252,16 @@ struct TranscriptSearchDialog {
     last_transcript_rev: u64,
 }
 
+#[derive(Debug, Clone)]
+struct AgentProgressDialog {
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AgentDetailDialog {
+    agent_tool_use_id: String,
+}
+
 #[derive(Clone)]
 struct EngineInputs {
     max_tokens: u32,
@@ -269,6 +284,10 @@ enum QueryEvent {
         result: serde_json::Value,
         is_error: bool,
     },
+    AgentProgress {
+        agent_tool_use_id: String,
+        update: claude_query::AgentProgressUpdate,
+    },
     PermissionRequest {
         id: String,
         name: String,
@@ -290,6 +309,18 @@ struct PermissionPrompt {
     tool_name: String,
     details: String,
     reply_tx: oneshot::Sender<claude_query::PermissionDecision>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentUiEntry {
+    tool_use_id: String,
+    description: String,
+    prompt: String,
+    started_at: Instant,
+    finished_at: Option<Instant>,
+    is_error: Option<bool>,
+    result_preview: Option<String>,
+    progress: claude_query::AgentProgressUpdate,
 }
 
 #[derive(Clone)]
@@ -350,6 +381,17 @@ impl claude_query::QueryObserver for TuiObserver {
             Ok(d) => d,
             Err(_) => claude_query::PermissionDecision::Deny,
         }
+    }
+
+    async fn on_agent_progress(
+        &self,
+        agent_tool_use_id: &str,
+        update: &claude_query::AgentProgressUpdate,
+    ) {
+        let _ = self.tx.send(QueryEvent::AgentProgress {
+            agent_tool_use_id: agent_tool_use_id.to_string(),
+            update: update.clone(),
+        });
     }
 }
 
@@ -792,6 +834,148 @@ impl App {
         self.toasts.retain(|t| t.expires_at > now);
     }
 
+    fn agent_by_id(&self, tool_use_id: &str) -> Option<&AgentUiEntry> {
+        self.agents
+            .iter()
+            .find(|agent| agent.tool_use_id == tool_use_id)
+    }
+
+    fn ensure_agent(
+        &mut self,
+        tool_use_id: &str,
+        description: Option<&str>,
+        prompt: Option<&str>,
+    ) -> &mut AgentUiEntry {
+        if let Some(idx) = self
+            .agents
+            .iter()
+            .position(|agent| agent.tool_use_id == tool_use_id)
+        {
+            let agent = &mut self.agents[idx];
+            if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
+                agent.description = desc.to_string();
+            }
+            if let Some(prompt) = prompt.map(str::trim).filter(|s| !s.is_empty()) {
+                agent.prompt = prompt.to_string();
+            }
+            return agent;
+        }
+
+        let description = description
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("sub-agent")
+            .to_string();
+        let prompt = prompt.unwrap_or_default().to_string();
+
+        self.agents.push(AgentUiEntry {
+            tool_use_id: tool_use_id.to_string(),
+            description,
+            prompt,
+            started_at: Instant::now(),
+            finished_at: None,
+            is_error: None,
+            result_preview: None,
+            progress: claude_query::AgentProgressUpdate::default(),
+        });
+        let idx = self.agents.len().saturating_sub(1);
+        &mut self.agents[idx]
+    }
+
+    fn update_agent_progress(
+        &mut self,
+        tool_use_id: &str,
+        update: claude_query::AgentProgressUpdate,
+    ) {
+        let agent = self.ensure_agent(tool_use_id, None, None);
+        agent.progress = update;
+    }
+
+    fn finish_agent(
+        &mut self,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+        result: &serde_json::Value,
+        is_error: bool,
+    ) {
+        let description = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let prompt = input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let agent = self.ensure_agent(tool_use_id, description, prompt);
+        agent.finished_at = Some(Instant::now());
+        agent.is_error = Some(is_error);
+        agent.result_preview = match result {
+            serde_json::Value::String(s) => Some(crate::one_line_preview(s, 120)),
+            other => serde_json::to_string(other)
+                .ok()
+                .map(|s| crate::one_line_preview(&s, 120)),
+        };
+    }
+
+    fn prune_agents(&mut self) {
+        let now = Instant::now();
+        // Keep running agents indefinitely. For completed agents, keep a bounded, recent set so
+        // `/agents` remains useful without growing unbounded.
+        self.agents.retain(|agent| {
+            agent
+                .finished_at
+                .map(|finished| now.duration_since(finished) < Duration::from_secs(600))
+                .unwrap_or(true)
+        });
+
+        let max_finished = 40usize;
+        let mut finished: Vec<(String, Instant)> = self
+            .agents
+            .iter()
+            .filter_map(|agent| agent.finished_at.map(|t| (agent.tool_use_id.clone(), t)))
+            .collect();
+        if finished.len() > max_finished {
+            finished.sort_by(|a, b| a.1.cmp(&b.1)); // oldest first
+            let drop_n = finished.len().saturating_sub(max_finished);
+            let mut drop_ids: HashSet<String> = HashSet::new();
+            for (id, _) in finished.into_iter().take(drop_n) {
+                drop_ids.insert(id);
+            }
+            if !drop_ids.is_empty() {
+                self.agents
+                    .retain(|agent| !drop_ids.contains(&agent.tool_use_id));
+            }
+        }
+
+        let Some(dialog) = self.dialog.take() else {
+            return;
+        };
+
+        match dialog {
+            DialogState::AgentDetail(detail) => {
+                if self.agent_by_id(&detail.agent_tool_use_id).is_some() {
+                    self.dialog = Some(DialogState::AgentDetail(detail));
+                } else {
+                    self.status = "ready".to_string();
+                }
+            }
+            DialogState::AgentProgress(mut dialog) => {
+                if self.agents.is_empty() {
+                    self.status = "ready".to_string();
+                    return;
+                }
+                dialog.selected = dialog.selected.min(self.agents.len().saturating_sub(1));
+                self.dialog = Some(DialogState::AgentProgress(dialog));
+            }
+            other => {
+                self.dialog = Some(other);
+            }
+        }
+    }
+
     fn apply_theme(&mut self, theme: Theme) {
         self.theme = theme;
 
@@ -813,6 +997,7 @@ impl App {
         self.transcript.clear();
         self.rendered.clear();
         self.tool_entry_for_id.clear();
+        self.agents.clear();
         self.permission_prompt = None;
         self.active_assistant_idx = None;
         self.active_thinking_idx = None;
@@ -879,6 +1064,7 @@ impl App {
         self.active_assistant_idx = None;
         self.active_thinking_idx = None;
         self.tool_entry_for_id.clear();
+        self.agents.clear();
         self.dismiss_typeahead();
         self.dialog = None;
         self.in_flight = false;
@@ -1157,6 +1343,12 @@ pub async fn run_tui(
         KeySequence::parse("ctrl+f")?,
         KeyAction::SearchTranscript,
     );
+    // Week 11: agent progress display.
+    keymap.add_binding(
+        &[KeyContext::Global],
+        KeySequence::parse("ctrl+g")?,
+        KeyAction::ShowAgents,
+    );
     // Week 8 deliverable: chord detection.
     keymap.add_binding(
         &[KeyContext::Global],
@@ -1279,6 +1471,7 @@ pub async fn run_tui(
         tool_entry_for_id: HashMap::new(),
         permission_prompt: None,
         always_allow_tools,
+        agents: Vec::new(),
         scroll_top: 0,
         scroll_follow: true,
         last_msg_view_height: 0,
@@ -1323,6 +1516,7 @@ pub async fn run_tui(
             }
             _ = tick.tick() => {
                 app.prune_toasts();
+                app.prune_agents();
                 if app.in_flight {
                     app.spinner_idx = (app.spinner_idx + 1) % SPINNER_FRAMES.len();
                 }
@@ -1907,6 +2101,9 @@ async fn handle_key_action(
         KeyAction::SearchTranscript => {
             open_transcript_search(app, None);
         }
+        KeyAction::ShowAgents => {
+            open_agent_progress_dialog(app);
+        }
         KeyAction::TypeaheadNext => {
             app.move_typeahead(1);
             app.status = "slash command".to_string();
@@ -2152,6 +2349,9 @@ async fn execute_slash_command(
                 );
             }
             app.status = format!("condensed {}", app.condensed);
+        }
+        "agents" => {
+            open_agent_progress_dialog(app);
         }
         "voice" => {
             app.push_system_message(
@@ -2560,10 +2760,23 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             );
             app.append_entry(entry);
             let idx = app.transcript.len().saturating_sub(1);
+            let tool_use_id = id.clone();
             app.tool_entry_for_id.insert(id, idx);
             app.status = tool_activity_status(&name, &input);
 
             if name == "Agent" {
+                let desc = input
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let prompt = input
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                app.ensure_agent(&tool_use_id, desc, prompt);
+
                 if let Some(desc) = input.get("description").and_then(|v| v.as_str()) {
                     let preview = crate::one_line_preview(desc, 60);
                     app.push_toast(
@@ -2619,6 +2832,7 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
             app.status = format!("{name} done");
 
             if name == "Agent" {
+                app.finish_agent(&id, &input, &result, is_error);
                 if let Some(desc) = input.get("description").and_then(|v| v.as_str()) {
                     let preview = crate::one_line_preview(desc, 60);
                     app.push_toast(
@@ -2628,6 +2842,12 @@ fn handle_query_event(app: &mut App, qev: QueryEvent) {
                     );
                 }
             }
+        }
+        QueryEvent::AgentProgress {
+            agent_tool_use_id,
+            update,
+        } => {
+            app.update_agent_progress(&agent_tool_use_id, update);
         }
         QueryEvent::Finished(result) => {
             let finished_idx = app.active_assistant_idx;
@@ -2974,10 +3194,14 @@ fn active_agent_hint(app: &App) -> Option<String> {
     }
 
     if labels.len() == 1 {
-        return Some(format!("agent {}", labels[0]));
+        return Some(format!("agent {} (Ctrl+G)", labels[0]));
     }
 
-    Some(format!("agents {} (+{})", labels[0], labels.len() - 1))
+    Some(format!(
+        "agents {} (+{}) (Ctrl+G)",
+        labels[0],
+        labels.len() - 1
+    ))
 }
 
 fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -3211,6 +3435,176 @@ fn centered_rect(
         .split(popup_layout[1]);
 
     horizontal[1]
+}
+
+fn format_agent_elapsed(started_at: Instant, finished_at: Option<Instant>) -> String {
+    let elapsed = finished_at
+        .unwrap_or_else(Instant::now)
+        .duration_since(started_at);
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        format!("{mins}m{rem:02}s")
+    }
+}
+
+fn agent_state_label(agent: &AgentUiEntry) -> &'static str {
+    match agent.finished_at {
+        Some(_) if agent.is_error == Some(true) => "failed",
+        Some(_) => "done",
+        None => "running",
+    }
+}
+
+fn agent_activity_lines(agent: &AgentUiEntry) -> Vec<String> {
+    agent
+        .progress
+        .recent_activities
+        .iter()
+        .rev()
+        .take(5)
+        .map(|activity| tool_activity_status(&activity.tool_name, &activity.input))
+        .collect()
+}
+
+fn agent_summary_line(agent: &AgentUiEntry, width: usize) -> String {
+    let state = agent_state_label(agent);
+    let timing = format_agent_elapsed(agent.started_at, agent.finished_at);
+    let preview = agent
+        .progress
+        .recent_activities
+        .last()
+        .map(|activity| tool_activity_status(&activity.tool_name, &activity.input))
+        .or_else(|| agent.progress.output_preview.clone())
+        .or_else(|| agent.result_preview.clone())
+        .unwrap_or_else(|| "starting".to_string());
+    crate::one_line_preview(
+        &format!(
+            "{} • {} • {} tool(s) • {} tokens • {} • {}",
+            agent.description,
+            state,
+            agent.progress.tool_use_count,
+            agent.progress.token_count,
+            timing,
+            preview
+        ),
+        width,
+    )
+}
+
+fn render_agent_progress_dialog(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    dialog: &AgentProgressDialog,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(82, 62, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Agent Progress");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(2)])
+        .split(inner);
+
+    let visible_h = rows[0].height as usize;
+    let start = list_window_start(dialog.selected, app.agents.len(), visible_h);
+    let items = app
+        .agents
+        .iter()
+        .skip(start)
+        .take(visible_h)
+        .enumerate()
+        .map(|(offset, agent)| {
+            let idx = start.saturating_add(offset);
+            let mut item = ListItem::new(Line::from(agent_summary_line(
+                agent,
+                rows[0].width.saturating_sub(2) as usize,
+            )));
+            if idx == dialog.selected {
+                item = item.style(app.theme.selection);
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(List::new(items), rows[0]);
+    f.render_widget(
+        Paragraph::new("Up/Down select • Enter details • Esc close • Ctrl+G open"),
+        rows[1],
+    );
+}
+
+fn render_agent_detail_dialog(
+    f: &mut ratatui::Frame<'_>,
+    app: &App,
+    dialog: &AgentDetailDialog,
+    area: ratatui::layout::Rect,
+) {
+    let popup = centered_rect(84, 68, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title("Agent Detail");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let Some(agent) = app.agent_by_id(&dialog.agent_tool_use_id) else {
+        f.render_widget(Paragraph::new("Agent no longer available."), inner);
+        return;
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let header = format!(
+        "Description: {}\nState: {} • {} tool(s) • {} tokens • {}\nTool use id: {}\nPrompt: {}",
+        agent.description,
+        agent_state_label(agent),
+        agent.progress.tool_use_count,
+        agent.progress.token_count,
+        format_agent_elapsed(agent.started_at, agent.finished_at),
+        agent.tool_use_id,
+        crate::one_line_preview(&agent.prompt, rows[0].width.saturating_sub(8) as usize),
+    );
+    f.render_widget(Paragraph::new(header), rows[0]);
+
+    let mut body = String::new();
+    if let Some(preview) = agent.progress.output_preview.as_deref() {
+        body.push_str("Recent output\n");
+        body.push_str(preview);
+        body.push_str("\n\n");
+    }
+
+    let activities = agent_activity_lines(agent);
+    body.push_str("Recent activities\n");
+    if activities.is_empty() {
+        body.push_str("- none yet");
+    } else {
+        for activity in activities {
+            body.push_str("- ");
+            body.push_str(&activity);
+            body.push('\n');
+        }
+    }
+
+    if let Some(preview) = agent.result_preview.as_deref() {
+        body.push_str("\nFinal result preview\n");
+        body.push_str(preview);
+    }
+
+    f.render_widget(Paragraph::new(body), rows[1]);
+    f.render_widget(Paragraph::new("Esc/Left back • Ctrl+G agent list"), rows[2]);
 }
 
 fn render_toasts(f: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
@@ -3524,6 +3918,26 @@ fn open_transcript_search(app: &mut App, initial_query: Option<String>) {
     app.status = "search transcript".to_string();
 }
 
+fn open_agent_progress_dialog(app: &mut App) {
+    app.keymap.clear_pending();
+    app.dismiss_typeahead();
+    app.reverse_history_search = None;
+    app.prune_agents();
+
+    if app.agents.is_empty() {
+        app.push_system_message(
+            "Agent Progress\n\nNo agents are currently running.\nStart a task that uses the `Agent` tool to see teammate progress here.",
+        );
+        app.status = "agents idle".to_string();
+        return;
+    }
+
+    app.dialog = Some(DialogState::AgentProgress(AgentProgressDialog {
+        selected: 0,
+    }));
+    app.status = "agent progress".to_string();
+}
+
 fn recompute_search_hits(
     dialog: &mut TranscriptSearchDialog,
     transcript: &[ChatEntry],
@@ -3606,6 +4020,8 @@ fn dialog_paste(dialog: &mut DialogState, text: &str) {
         DialogState::TranscriptSearch(search) => {
             search.query.insert_str(text.trim_end());
         }
+        DialogState::AgentProgress(_) => {}
+        DialogState::AgentDetail(_) => {}
     }
 }
 
@@ -3804,6 +4220,45 @@ async fn handle_dialog_key(
             }
             _ => {}
         },
+        DialogState::AgentProgress(dialog) => match key.code {
+            KeyCode::Esc => {
+                app.status = "ready".to_string();
+                keep_dialog = false;
+            }
+            KeyCode::Up => {
+                if !app.agents.is_empty() {
+                    dialog.selected = dialog.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if !app.agents.is_empty() {
+                    dialog.selected = (dialog.selected + 1).min(app.agents.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(agent) = app.agents.get(dialog.selected) {
+                    app.dialog = Some(DialogState::AgentDetail(AgentDetailDialog {
+                        agent_tool_use_id: agent.tool_use_id.clone(),
+                    }));
+                    app.status = "agent detail".to_string();
+                    keep_dialog = false;
+                }
+            }
+            _ => {}
+        },
+        DialogState::AgentDetail(detail) => match key.code {
+            KeyCode::Esc | KeyCode::Left => {
+                let selected = app
+                    .agents
+                    .iter()
+                    .position(|agent| agent.tool_use_id == detail.agent_tool_use_id)
+                    .unwrap_or(0);
+                app.dialog = Some(DialogState::AgentProgress(AgentProgressDialog { selected }));
+                app.status = "agent progress".to_string();
+                keep_dialog = false;
+            }
+            _ => {}
+        },
     }
 
     if keep_dialog {
@@ -3899,6 +4354,8 @@ fn render_dialog_modal(
         DialogState::TranscriptSearch(dialog) => {
             render_transcript_search_dialog(f, app, dialog, area)
         }
+        DialogState::AgentProgress(dialog) => render_agent_progress_dialog(f, app, dialog, area),
+        DialogState::AgentDetail(dialog) => render_agent_detail_dialog(f, app, dialog, area),
     }
 }
 
@@ -5244,6 +5701,7 @@ mod tests {
             tool_entry_for_id: HashMap::new(),
             permission_prompt: None,
             always_allow_tools: Arc::new(Mutex::new(HashSet::new())),
+            agents: Vec::new(),
             scroll_top: 0,
             scroll_follow: true,
             last_msg_view_height: 0,
